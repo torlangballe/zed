@@ -1,0 +1,68 @@
+//go:build zui
+
+package zwidgets
+
+// ImagesSetView uses a value that can give a String() as a|b|c, and shows it as a row of images,
+// where each image is found in images/flags/<prefix>/a.png etc.
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/torlangballe/zed/zui/zcontainer"
+	"github.com/torlangballe/zed/zui/zimageview"
+	"github.com/torlangballe/zed/zui/zstyle"
+	"github.com/torlangballe/zed/zutil/zfloat"
+	"github.com/torlangballe/zed/zutil/zgeo"
+	"github.com/torlangballe/zed/zutil/zstr"
+)
+
+type ImagesSetView struct {
+	zcontainer.StackView
+	prefix    string
+	imageSize zgeo.Size
+}
+
+type PathsGetter interface {
+	ImagePaths() []string
+}
+
+func NewImagesSetView(name, imagePathPrefix string, imageSize zgeo.Size, styling *zstyle.Styling) *ImagesSetView {
+	if imageSize.IsNull() {
+		imageSize = zgeo.SizeBoth(16)
+	}
+	v := &ImagesSetView{}
+	v.Init(v, false, name)
+	v.prefix = imagePathPrefix
+	v.imageSize = imageSize
+
+	spacing := 2.0
+	if styling != nil && styling.Spacing != zfloat.Undefined {
+		spacing = styling.Spacing
+	}
+	v.SetSpacing(spacing)
+	return v
+}
+
+func (v *ImagesSetView) SetValueWithAny(bitset any) {
+	v.RemoveAllChildren()
+	var parts []string
+	getter, _ := bitset.(PathsGetter)
+	if getter != nil {
+		parts = getter.ImagePaths()
+	} else {
+		strings.Split(fmt.Sprint(bitset), "|")
+	}
+	sort.Strings(parts)
+	for _, part := range parts {
+		path := zstr.Concat("/", "images/flags", v.prefix, part) + ".png"
+		iv := zimageview.New(nil, true, path, v.imageSize)
+		iv.DownsampleImages = true
+		iv.SetToolTip(part)
+		v.Add(iv, zgeo.CenterLeft)
+	}
+	if v.IsPresented() {
+		v.ArrangeChildren()
+	}
+}

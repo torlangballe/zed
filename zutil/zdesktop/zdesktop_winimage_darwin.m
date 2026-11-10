@@ -1,0 +1,133 @@
+#import <Foundation/Foundation.h>
+#import <CoreServices/CoreServices.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <Cocoa/Cocoa.h>
+
+// capture video:
+// https://developer.apple.com/documentation/screencapturekit/capturing-screen-content-in-macos?language=objc
+
+CGRect croppedRect(CGRect rect, CGRect with)  {
+    CGRect out;
+    out.origin.x = rect.origin.x + with.origin.x;
+    out.origin.y = rect.origin.y + with.origin.y;
+    out.size.width = rect.size.width + with.size.width;
+    out.size.height = rect.size.height + with.size.height;
+    return out;
+}
+
+void imageOfWindow(NSString *winTitle, NSString *appBundleID, int displayID, int preflightOnly, CGRect insetRect,  void(^got)(CGImageRef image, NSString *err)) {
+    [SCShareableContent getShareableContentExcludingDesktopWindows: true
+                                               onScreenWindowsOnly: true
+                                                 completionHandler: ^(SCShareableContent * _Nullable shareableContent, NSError * _Nullable error) {
+        SCRunningApplication *foundApp = nil;
+        SCWindow *foundWin = nil;
+        if (error) {
+            got(nil, error.localizedDescription);
+            return;
+        }
+        for (SCRunningApplication *app in shareableContent.applications) {
+            if ([app.bundleIdentifier isEqualToString: appBundleID]) {
+                foundApp = app;
+            }
+        }
+        if (appBundleID != nil && foundApp == nil) {
+            got(nil, @"App not Found");
+            return;
+        }
+        bool forWindow = ([winTitle length] != 0);
+        SCContentFilter *filter;
+        if (forWindow) {
+            for (SCWindow *win in shareableContent.windows) {
+                if ([ win.title isEqualToString: winTitle]) {
+                    foundWin = win;
+                    break;
+                }
+            }
+            if (foundWin == nil) {
+                got(nil, @"Window not Found for Capture");
+                return;
+            }
+            filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:foundWin];
+        } else {
+            SCDisplay *display;
+            for (SCDisplay *d in shareableContent.displays) {
+            NSLog(@"Display: %d\n", d.displayID);
+                display = d;
+            }
+            filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows: @[]];
+        }
+        if (preflightOnly == 1) {
+            got(nil, nil);
+            return;
+        }
+        SCStreamConfiguration *configuration = [[SCStreamConfiguration alloc] init];
+        configuration.capturesAudio = NO;
+        configuration.excludesCurrentProcessAudio = YES;
+        configuration.preservesAspectRatio = YES;
+        configuration.showsCursor = NO;
+        configuration.captureResolution = SCCaptureResolutionBest;
+        if (insetRect.size.width != 0) {
+            CGRect frame = foundWin.frame;
+            frame.origin = CGPointMake(0, 0);
+            configuration.sourceRect = insetRect;
+            configuration.width = NSWidth(insetRect) * filter.pointPixelScale;
+            configuration.height = NSHeight(insetRect) * filter.pointPixelScale;
+        } else {
+            configuration.width = NSWidth(filter.contentRect) * filter.pointPixelScale;
+            configuration.height = NSHeight(filter.contentRect) * filter.pointPixelScale;
+        }
+        [SCScreenshotManager captureImageWithFilter:filter configuration:configuration completionHandler:^(CGImageRef  _Nullable cgImage, NSError * _Nullable error) {
+            if (error) {
+                got(nil, [error localizedDescription]);
+                return;
+            }
+            if (cgImage == NULL) {
+                NSLog(@"Image capture failed");
+            }
+            got(cgImage, nil);
+        }];
+        [ filter release];
+        [ configuration release];
+    }];
+}
+
+
+char cerr[1024];
+const char *ImageOfWindow(char *winTitle, char *appBundleID, int displayID, int preflightOnly, CGRect insetRect, CGImageRef *cgImagePtr) {
+    const int timeoutSecs = 2; // it should only take 10ms ish for smaller sizes, so lets keep it small to avoid congestion
+    NSString *nstitle = [NSString stringWithUTF8String:winTitle];
+    NSString *nsapp = [NSString stringWithUTF8String:appBundleID];
+    __block NSString *snapErr = nil;
+    __block dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block bool timedOut = false;
+    imageOfWindow(nstitle, nsapp, displayID, preflightOnly, insetRect, ^(CGImageRef image, NSString *err) {
+        if (timedOut) {
+            NSLog(@"ImageOfWindow That Timed out finally finished: %s\n", winTitle);
+        }
+        [nstitle release];
+        [nsapp release];
+        if (err != nil) {
+            snapErr = err;
+        } else {
+            if (image != nil) {
+                CFRetain(image);
+                *cgImagePtr = image;
+            }
+        }
+        dispatch_semaphore_signal(sem);
+    });
+   int64_t timeoutAt = dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutSecs * NSEC_PER_SEC);
+    if (dispatch_semaphore_wait(sem, timeoutAt)) {
+    // if (dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER)) {
+        timedOut = true;
+        dispatch_release(sem);
+        return "timed out";
+    } else if (snapErr != nil) {
+            NSLog(@"ImageOfWindow Error: %s %@\n", winTitle, snapErr);
+            [snapErr getCString:cerr maxLength:1024 encoding:NSUTF8StringEncoding];
+            dispatch_release(sem);
+            return cerr;
+    }
+    dispatch_release(sem);
+    return "";
+}

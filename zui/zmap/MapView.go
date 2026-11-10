@@ -1,0 +1,32 @@
+//go:build zui
+
+package zmap
+
+import (
+	"github.com/torlangballe/zed/zui/zcanvas"
+	"github.com/torlangballe/zed/zui/zview"
+	"github.com/torlangballe/zed/zutil/zgeo"
+	"github.com/torlangballe/zed/zutil/zlog"
+)
+
+type MapView struct {
+	zview.NativeView
+	baseMapView
+	canvas      *zcanvas.Canvas
+	minSize     zgeo.Size
+	pressed     func()
+	longPressed func()
+
+	draw func(rect zgeo.Rect, canvas *zcanvas.Canvas, view zview.View)
+}
+
+func MapViewNew(center zgeo.Pos, zoom int) *MapView {
+	v := &MapView{}
+	v.Init(v, center, zoom)
+	return v
+}
+
+func (v *MapView) CalculatedSize(total zgeo.Size) (s, max zgeo.Size) {
+	zlog.Info("mapview cs:", v.minSize)
+	return v.minSize, zgeo.Size{}
+}

@@ -1,0 +1,495 @@
+package zslices
+
+import (
+	"errors"
+	"fmt"
+	"math/rand"
+	"reflect"
+	"slices"
+
+	"github.com/torlangballe/zed/zutil/zdebug"
+	"github.com/torlangballe/zed/zutil/zlog"
+	"github.com/torlangballe/zed/zutil/zmap"
+)
+
+// https://github.com/golang/go/wiki/SliceTricks#delete
+
+func CheckIsSlicePtr(s any) error {
+	if s == nil {
+		return errors.New("slice is nil")
+	}
+
+	slicePtrValue := reflect.ValueOf(s)
+	// should be pointer
+	if slicePtrValue.Type().Kind() != reflect.Ptr {
+		return errors.New("should be slice pointer")
+	}
+
+	sliceValue := slicePtrValue.Elem()
+	// should be slice
+	if sliceValue.Type().Kind() != reflect.Slice {
+		return errors.New("should be slice pointer")
+	}
+
+	return nil
+}
+
+func RemoveAt(slice any, index int) error {
+	err := CheckIsSlicePtr(slice)
+	if err != nil {
+		return zlog.Fatal(err, zlog.StackAdjust(1), "-Not slice pointer", slice, reflect.TypeOf(slice).Kind(), reflect.TypeOf(slice))
+	}
+
+	slicePtrValue := reflect.ValueOf(slice)
+	sliceValue := slicePtrValue.Elem()
+	if index < 0 || index >= sliceValue.Len() {
+		return zlog.Error("index out of range:", index, sliceValue.Len(), zdebug.CallingStackString())
+	}
+	sliceValue.Set(reflect.AppendSlice(sliceValue.Slice(0, index), sliceValue.Slice(index+1, sliceValue.Len())))
+	return nil
+}
+
+func Empty(slicePtr any) {
+	rval := reflect.ValueOf(slicePtr).Elem()
+	for {
+		length := rval.Len()
+		if length == 0 {
+			break
+		}
+		RemoveAt(slicePtr, length-1)
+	}
+}
+
+func AddEmptyElementAtEnd(slicePtr any) int {
+	e := MakeAnElementOfSliceType(slicePtr)
+	return AddAtEnd(slicePtr, e)
+}
+
+func MakeAnElementOfSliceRValType(rval reflect.Value) reflect.Value {
+	if rval.Kind() == reflect.Pointer {
+		rval = rval.Elem()
+	}
+	// zlog.Info("MakeAnElementOfSliceType:", rval.Type(), rval.Kind())
+	// return reflect.New(rval.Type()).Elem().Interface()
+	return reflect.New(rval.Type().Elem()).Elem()
+}
+
+func MakeAnElementOfSliceType(slice any) any {
+	return MakeAnElementOfSliceRValType(reflect.ValueOf(slice)).Interface()
+}
+
+func AddAtEnd(slicePtr any, add any) int {
+	return RValAddAtEnd(reflect.ValueOf(slicePtr), reflect.ValueOf(add))
+}
+
+func RValAddAtEnd(slicePtrVal, add reflect.Value) int {
+	rval := reflect.Append(slicePtrVal.Elem(), add)
+	slicePtrVal.Elem().Set(rval)
+	return slicePtrVal.Elem().Len() - 1
+}
+
+// MakeEmptySliceOfElement returns an empty []T as an reflect.Value, where T is the type of element.
+func MakeEmptyRValSliceOfElement(element reflect.Value) reflect.Value {
+	s := reflect.MakeSlice(reflect.SliceOf(element.Type()), 0, 0)
+	n := reflect.New(s.Type()).Elem()
+	n.Set(s)
+	return n
+}
+
+func Behead(slice any) {
+	RemoveAt(slice, 0)
+}
+
+func Delete[S comparable](s *[]S, dels ...S) int {
+	count := 0
+	for i := 0; i < len(*s); {
+		if slices.Contains(dels, (*s)[i]) {
+			count++
+			RemoveAt(s, i)
+			break
+		} else {
+			i++
+		}
+	}
+	return count
+}
+
+// SlicesHaveUnion returns first index into A and B where they are the same, outer looping thru A.
+func ReflectSlicesHaveUnion(a, b reflect.Value) (iA, iB int) {
+	for ia := 0; ia < a.Len(); ia++ {
+		for ib := 0; ib < b.Len(); ib++ {
+			if reflect.DeepEqual(a.Index(ia), b.Index(ib)) {
+				return ia, ib
+			}
+		}
+	}
+	return -1, -1
+}
+
+func ReflectIndexOf(slice, of reflect.Value) int {
+	for i := 0; i < slice.Len(); i++ {
+		if slice.Index(i).Equal(of) {
+			return i
+		}
+	}
+	return -1
+}
+
+func Deleted[S comparable](slice []S, dels ...S) []S {
+	var out []S
+	for _, s := range slice {
+		if !slices.Contains(dels, s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func RemoveFromFunc[S any](s *[]S, del func(s S) bool) int {
+	var count int
+	for i := 0; i < len(*s); {
+		if del((*s)[i]) {
+			RemoveAt(s, i)
+			count++
+			continue
+		}
+		i++
+	}
+	return count
+}
+
+func RemoveFromSliceFunc[T any](slice *[]T, dels []T, equal func(a, b T) bool) int {
+	return RemoveFromFunc(slice, func(t T) bool {
+		for _, del := range dels {
+			if equal(t, del) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func CopyTo(toPtr, slice any) {
+	sliceVal := reflect.ValueOf(slice)
+	destVal := reflect.MakeSlice(sliceVal.Type(), sliceVal.Len(), sliceVal.Len())
+	reflect.Copy(destVal, sliceVal)
+	toVal := reflect.ValueOf(toPtr)
+	toVal.Elem().Set(destVal)
+}
+
+// func NewCopy(slice any) any {
+// 	sliceVal := reflect.ValueOf(slice)
+// 	if sliceVal.Type().Elem().Kind() == reflect.Interface {
+// 		zlog.Info("NewCopy:", sliceVal.Type().Elem().Kind(), sliceVal.Type().Elem().Elem().Kind())
+// 		// sliceVal = sliceVal.Type().Elem()
+// 	}
+// 	destVal := reflect.MakeSlice(sliceVal.Type(), sliceVal.Len(), sliceVal.Len())
+// 	destNew := reflect.New(destVal.Type())
+// 	destNew.Elem().Set(destVal)
+// 	reflect.Copy(destNew.Elem(), sliceVal)
+// 	return destNew.Interface()
+// }
+
+func Copy[S any](s []S) []S {
+	n := make([]S, len(s))
+	copy(n, s)
+	return n
+}
+
+func AddToCopy[S any](s []S, add S) []S {
+	n := make([]S, len(s)+1)
+	copy(n, s)
+	n[len(s)] = add
+	return n
+}
+
+func IndexOf(length int, is func(i int) bool) int {
+	for i := 0; i < length; i++ {
+		if is(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+func ContainsFunc[S any](slice []S, is func(s S) bool) bool {
+	i := slices.IndexFunc(slice, is)
+	return i != -1
+}
+
+func FindFunc[S any](slice []S, is func(s S) bool) (*S, int) {
+	i := slices.IndexFunc(slice, is)
+	if i == -1 {
+		return nil, -1
+	}
+	return &slice[i], i
+}
+
+func Reversed[S any](s []S) []S {
+	n := make([]S, len(s))
+	copy(n, s)
+	slices.Reverse(n)
+	return n
+}
+
+func Swap[A any](slice []A, i, j int) {
+	t := slice[i]
+	slice[i] = slice[j]
+	slice[j] = t
+}
+
+// Add is a convenience function for appending to a slice pointer.
+// It's used if what you want to append to is very long to type twice with append:
+// long = append(long, a)
+func Add[T any](s *[]T, a ...T) {
+	*s = append(*s, a...)
+}
+
+func AddToSet[T comparable](s *[]T, adds ...T) int {
+	var count int
+	for _, a := range adds {
+		if !slices.Contains(*s, a) {
+			Add(s, a)
+			count++
+		}
+	}
+	return count
+}
+
+func AddToSetFunc[T any](slice *[]T, adds []T, equal func(a, b T) bool) int {
+	var count int
+outer:
+	for _, a := range adds {
+		for _, s := range *slice {
+			if equal(a, s) {
+				continue outer
+			}
+		}
+		count++
+		Add(slice, a)
+	}
+	return count
+}
+
+func Union[T comparable](a, b []T) []T {
+	n := slices.Clone(a)
+	for _, ib := range b {
+		AddToSet(&n, ib)
+	}
+	return n
+}
+
+// Exclusion returns elements that are not BOTH in a and b
+func Exclusion[T comparable](a, b []T) []T { // todo: Done in slices already???
+	var x []T
+	n := slices.Clone(a)
+	for _, ib := range b {
+		i := slices.Index(n, ib)
+		if i == -1 {
+			x = append(x, ib)
+		} else {
+			RemoveAt(&n, i)
+			i--
+		}
+	}
+	return append(x, n...)
+}
+
+func SubtractedFunc[T any](a, sub []T, equal func(a, b T) bool) []T {
+	n := make([]T, 0, len(a))
+	for _, is := range sub {
+		i := IndexOf(len(a), func(i int) bool {
+			return equal(a[i], is)
+		})
+		if i == -1 {
+			n = append(n, is)
+		}
+	}
+	return n
+}
+
+func SetsOverlap[S comparable](a, b []S) bool {
+	for _, ib := range b {
+		if slices.Contains(a, ib) {
+			return true
+		}
+	}
+	return false
+}
+
+func Reduced[A any](slice []A, keep func(a A) bool) []A {
+	var snew []A
+	for i, s := range slice {
+		if keep(slice[i]) {
+			snew = append(snew, s)
+		}
+	}
+	return snew
+}
+
+func Random[S any](slice []S) S {
+	i := RandomIndex(slice)
+	return slice[i]
+}
+
+func RandomIndex[S any](slice []S) int {
+	zlog.Assert(len(slice) != 0)
+	i := rand.Int31n(int32(len(slice)))
+	return int(i)
+}
+
+func JoinToString[S any](slice []S, sep string) string {
+	var out string
+	for i, s := range slice {
+		str := fmt.Sprint(s)
+		if i != 0 {
+			out += sep
+		}
+		out += str
+	}
+	return out
+}
+
+func SplitWithFunc[S any](slice []S, match func(s S) bool) (is []S, not []S) {
+	for _, s := range slice {
+		if match(s) {
+			is = append(is, s)
+		} else {
+			not = append(not, s)
+		}
+	}
+	return is, not
+}
+
+func MapFunc[S any, O any](slice []S, mapFunc func(s S) O) []O {
+	out := make([]O, len(slice))
+	for i, s := range slice {
+		out[i] = mapFunc(s)
+	}
+	return out
+}
+
+func FilterMappedFunc[S any, O any](slice []S, mapFunc func(s S) (O, bool)) []O {
+	out := make([]O, len(slice))
+	for _, s := range slice {
+		r, keep := mapFunc(s)
+		if keep {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func FilteredFunc[S any](slice []S, keep func(s S) bool) []S {
+	out := make([]S, 0, len(slice))
+	for _, s := range slice {
+		if keep(s) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func AddOrReplaceFunc[S any](slice *[]S, add S, equal func(a, b S) bool) {
+	for i, s := range *slice {
+		if equal(add, s) {
+			(*slice)[i] = add
+			return
+		}
+	}
+	*slice = append(*slice, add)
+}
+
+func InsertSortedFunc[S any](slice []S, insert S, less func(a, b S) bool) []S {
+	for i, s := range slice {
+		if less(s, insert) {
+			return slices.Insert(slice, i, insert)
+		}
+	}
+	return append(slice, insert)
+}
+
+func Pop[S any](s *[]S) S {
+	slen := len(*s)
+	zlog.Assert(slen > 0)
+	top := (*s)[slen-1]
+	*s = (*s)[:slen-1]
+	return top
+}
+
+func Top[S any](s []S) S {
+	slen := len(s)
+	zlog.Assert(slen > 0)
+	return (s)[slen-1]
+}
+
+func SortByFrequency[S comparable](slice []S) ([]S, []int) {
+	m := map[S]int{}
+	for _, s := range slice {
+		m[s]++
+	}
+	counts, keys := zmap.SortedValuesFunc(m, func(a, b int) bool {
+		return a > b
+	})
+	return keys, counts
+}
+
+func MoveElement[S any](slice []S, fromIndex, toIndex int) {
+	if fromIndex == toIndex {
+		return
+	}
+	last := len(slice) - 1
+	e := slice[fromIndex]
+	if toIndex > fromIndex {
+		toIndex = min(last, toIndex)
+		for i := fromIndex; i < toIndex; i++ {
+			slice[i] = slice[i+1]
+		}
+	} else {
+		for i := min(last, fromIndex); i > toIndex; i-- {
+			slice[i] = slice[i-1]
+		}
+	}
+	slice[toIndex] = e
+}
+
+func IsInItems[C comparable](c C, slice ...C) bool {
+	return slices.Contains(slice, c)
+}
+
+func Clamped[S any](s []S, i int) S {
+	if i >= len(s) {
+		i = len(s) - 1
+	}
+	if i < 0 {
+		i = 0
+	}
+	return s[i]
+}
+
+func Any[S any](slice []S) []any {
+	out := make([]any, len(slice))
+	for i, s := range slice {
+		out[i] = s
+	}
+	return out
+}
+
+func SplitFunc[S any](slice []S, isFunc func(s S) bool) (is, isnt []S) {
+	for _, s := range slice {
+		if isFunc(s) {
+			is = append(is, s)
+		} else {
+			isnt = append(isnt, s)
+		}
+	}
+	return is, isnt
+}
+
+// SortBoolsLess is a convenience function for use with sort.Slice, returning true if a < b, false if a > b, and same=true if equal.
+func SortBoolsLess(a, b bool) (less, same bool) {
+	if a == b {
+		return false, true
+	}
+	return !a, false
+}

@@ -1,0 +1,373 @@
+// HeaderView is a stack of buttons that represent a header.
+// These are created using the Populate method with a slice of Header structs.
+// if the Header struct's SortSmallFirst is not undefined, it handles pressing the header button
+// and switching sorting small first/last, and setting SortOrder to a list of what to sort first.
+// The FitToRowStack method makes the header buttons the same size as the items in a stack.
+
+//go:build zui
+
+package zheader
+
+import (
+	"fmt"
+	"math"
+	"sort"
+
+	"github.com/torlangballe/zed/zui/zcontainer"
+	"github.com/torlangballe/zed/zui/zdocs"
+	"github.com/torlangballe/zed/zui/zfields"
+	"github.com/torlangballe/zed/zui/zimageview"
+	"github.com/torlangballe/zed/zui/zkeyboard"
+	"github.com/torlangballe/zed/zui/zlabel"
+	"github.com/torlangballe/zed/zui/zshape"
+	"github.com/torlangballe/zed/zui/zview"
+	"github.com/torlangballe/zed/zutil/zbool"
+	"github.com/torlangballe/zed/zutil/zfloat"
+	"github.com/torlangballe/zed/zutil/zgeo"
+	"github.com/torlangballe/zed/zutil/zkeyvalue"
+	"github.com/torlangballe/zed/zutil/zlog"
+	"github.com/torlangballe/zed/zutil/zslices"
+	"github.com/torlangballe/zed/zutil/zwords"
+)
+
+type Header struct {
+	FieldName string
+	Title     string
+	Align     zgeo.Alignment
+	Justify   zgeo.Alignment
+	// Height         float64
+	ImagePath          string
+	LightenForDarkMode bool
+	MinWidth           float64
+	MaxWidth           float64
+	ImageSize          zgeo.Size
+	Tip                string
+	SortSmallFirst     zbool.BoolInd
+	ShowIfExtraSpace   bool
+	SortPriority       int
+	Lockable           bool
+}
+
+type HeaderView struct {
+	zcontainer.StackView
+	SortOrder             []zfields.SortInfo
+	HeaderPressedFunc     func(id string)
+	HeaderLongPressedFunc func(id string)
+	SortingPressedFunc    func()
+	LockPressedFunc       func(id string)
+	LockedCount           int
+}
+
+func NewView(storeName string) *HeaderView {
+	v := &HeaderView{}
+	v.StackView.Init(v, false, storeName)
+	v.SetSpacing(0)
+	return v
+}
+
+func (v *HeaderView) updateTriangle(triangle *zimageview.ImageView, id string) {
+	i := v.findSortInfo(id)
+	sorting := v.SortOrder[i]
+	if i == 0 {
+		triangle.SetAlpha(1)
+	} else {
+		triangle.SetAlpha(0.5)
+	}
+	num := zwords.OrdinalNumber(i + 1)
+	tip := "order " + num + ", sort "
+	str := "down"
+	if sorting.SmallFirst {
+		tip += "ascending"
+		str = "up"
+	} else {
+		tip += "descending"
+	}
+	triangle.SetToolTip(tip)
+
+	str = fmt.Sprintf("images/zcore/sort-triangle-%s.png", str)
+	triangle.SetImage(nil, str, nil)
+}
+
+func makeKey(name string) string {
+	return "zheader.HeaderView/SortOrder/" + name
+}
+
+func getUserAdjustedSortOrder(tableName string) (order []zfields.SortInfo) {
+	key := makeKey(tableName)
+	zkeyvalue.DefaultStore.GetObject(key, &order)
+	return
+}
+
+func SetUserAdjustedSortOrder(tableName string, order []zfields.SortInfo) {
+	key := makeKey(tableName)
+	zkeyvalue.DefaultStore.SetObject(order, key, true)
+}
+
+func (v *HeaderView) findSortInfo(sortOrderID string) int {
+	for i := range v.SortOrder {
+		if v.SortOrder[i].FieldName == sortOrderID {
+			return i
+		}
+	}
+	return -1
+}
+
+func (v *HeaderView) handleButtonPressed(button *zshape.ImageButtonView, h Header) {
+	if h.SortSmallFirst != zbool.Unknown {
+		si := v.findSortInfo(h.FieldName)
+		sorting := v.SortOrder[si]
+		sorting.SmallFirst = !sorting.SmallFirst
+		zslices.RemoveAt(&v.SortOrder, si)
+		v.SortOrder = append([]zfields.SortInfo{sorting}, v.SortOrder...)
+		for _, c := range v.GetChildren(false) {
+			ib, _ := c.(*zshape.ImageButtonView)
+			if ib != nil {
+				tri, _ := ib.FindViewWithName("sort", false)
+				if tri != nil {
+					tri.Native().SetAlpha(0.5)
+				}
+			}
+		}
+		sort, _ := button.FindViewWithName("sort", false)
+		triangle := sort.(*zimageview.ImageView)
+		v.updateTriangle(triangle, h.FieldName)
+		SetUserAdjustedSortOrder(v.ObjectName(), v.SortOrder)
+		if v.SortingPressedFunc != nil {
+			v.SortingPressedFunc()
+		}
+	}
+	if v.HeaderPressedFunc != nil {
+		v.HeaderPressedFunc(h.FieldName)
+	}
+}
+
+func (v *HeaderView) Populate(headers []Header) {
+	type newSort struct {
+		fieldName string
+		small     bool
+		pri       int
+	}
+	v.SortOrder = getUserAdjustedSortOrder(v.ObjectName())
+	zslices.RemoveFromFunc(&v.SortOrder, func(si zfields.SortInfo) bool { // let's remove any incorrect id's from user stored sort order, in case we changed field names
+		for _, h := range headers {
+			if si.FieldName == h.FieldName {
+				return false
+			}
+		}
+		return true
+	})
+	var newSorts []newSort
+	for _, h := range headers {
+		if h.SortSmallFirst != zbool.Unknown && v.findSortInfo(h.FieldName) == -1 {
+			newSorts = append(newSorts, newSort{fieldName: h.FieldName, small: h.SortSmallFirst.Bool(), pri: h.SortPriority})
+		}
+	}
+	sort.Slice(newSorts, func(i, j int) bool {
+		pi := newSorts[i]
+		pj := newSorts[j]
+		if pi.pri == 0 {
+			pi.pri = 1000 + i
+		}
+		if pj.pri == 0 {
+			pj.pri = 1000 + j
+		}
+		return pi.pri < pj.pri
+	})
+	for _, n := range newSorts {
+		v.SortOrder = append(v.SortOrder, zfields.SortInfo{FieldName: n.fieldName, SmallFirst: n.small})
+	}
+	SetUserAdjustedSortOrder(v.ObjectName(), v.SortOrder)
+	// for _, s := range v.SortOrder {
+	// 	zlog.Info("SO:", s.FieldName)
+	// }
+	for _, h := range headers {
+		// zlog.Info("POPULATE:", h.FieldName, h.Title)
+		cell := zcontainer.Cell{}
+		cell.Alignment = h.Align
+		header := h
+		s := zgeo.SizeD(h.MinWidth, 26)
+		button := zshape.ImageButtonViewNew(h.Title, "gray-header", s, zshape.DefaultInsets)
+		button.TextMargin = zgeo.RectFromXY2(6, 0, 0, 0)
+		// zlog.Info("HEADER:", h.Title, h.Justify, h.Align)
+		j := h.Justify
+		if j == zgeo.AlignmentNone {
+			j = zgeo.Left
+		}
+		button.SetMargin(zgeo.RectFromXY2(1, -1, -1, 0))
+		button.SetTextAlignment(j)
+		if h.ImagePath != "" {
+			iv := zimageview.NewWithCachedPath(h.ImagePath, h.ImageSize)
+			if h.LightenForDarkMode {
+				iv.MixColorForDarkMode = zfields.DarkModeWhiten
+			}
+			iv.SetMinSize(h.ImageSize)
+			iv.SetObjectName(h.FieldName + ".image")
+			button.Add(iv, zgeo.Center, zgeo.SizeNull)
+		}
+		button.SetTextColor(zgeo.ColorWhite)
+		button.SetObjectName(h.FieldName)
+		if h.Tip != "" {
+			button.SetToolTip(h.Tip)
+		}
+		cell.View = button
+
+		button.SetPressedHandler("zheader.Pressed", zkeyboard.ModifierNone, func() {
+			v.handleButtonPressed(button, header)
+		})
+		button.SetLongPressedHandler("zheader.Long", zkeyboard.ModifierNone, func() {
+			if v.HeaderLongPressedFunc != nil {
+				v.HeaderLongPressedFunc(button.ObjectName())
+			}
+		})
+		if h.Lockable {
+			// zlog.Info("POPULATE: Lock", h.FieldName, h.Title)
+			lockLabel := zlabel.New("")
+			lockLabel.SetObjectName("lockLabel")
+			lockLabel.SetTextAlignment(zgeo.Right)
+			lockLabel.SetColor(zgeo.ColorYellow)
+			lockLabel.Show(false)
+			button.Add(lockLabel, zgeo.CenterRight, zgeo.SizeD(-6, -3))
+
+			lock := zimageview.NewWithCachedPath("images/zcore/lock.png", zgeo.SizeD(14, 20))
+			lock.SetObjectName("lock")
+			lock.Show(false)
+			button.Add(lock, zgeo.CenterRight, zgeo.SizeD(-4, -5))
+			lock.SetPressedHandler("", zkeyboard.ModifierNone, func() {
+				if zlog.ErrorIf(v.LockPressedFunc == nil, h.FieldName) {
+					return
+				}
+				v.LockPressedFunc(h.FieldName)
+			})
+		}
+		if h.SortSmallFirst != zbool.Unknown {
+			triangle := zimageview.NewWithCachedPath("", zgeo.SizeD(6, 5))
+			triangle.SetObjectName("sort")
+			//			triangle.Show(false)
+			button.Add(triangle, zgeo.TopRight, zgeo.SizeD(2, 3))
+			v.updateTriangle(triangle, h.FieldName)
+		}
+		bcs, _ := button.CalculatedSize(zgeo.SizeNull)
+		zfloat.Maximize(&h.MinWidth, bcs.W)
+		if h.MaxWidth != 0 {
+			zfloat.Maximize(&cell.MaxSize.W, math.Max(h.MaxWidth, h.MinWidth))
+		}
+		v.AddCell(cell, -1)
+	}
+}
+
+func GetLockViews(headerButton *zshape.ImageButtonView) (*zlabel.Label, *zimageview.ImageView) {
+	lock, _ := headerButton.FindViewWithName("lock", false)
+	label, _ := headerButton.FindViewWithName("lockLabel", false)
+	if lock == nil {
+		return nil, nil
+	}
+	return label.(*zlabel.Label), lock.(*zimageview.ImageView)
+}
+
+func ShowLock(headerButton *zshape.ImageButtonView, show bool) {
+	label, lock := GetLockViews(headerButton)
+	if lock != nil {
+		label.Show(show)
+		lock.Show(show)
+	}
+}
+
+func (v *HeaderView) FitToRowStack(stack *zcontainer.StackView, xdiff float64) {
+	var cells []zcontainer.Cell
+
+	hr := v.Rect()
+	for _, c := range stack.Cells {
+		if c.View.Native().IsShown() && !c.Collapsed && !c.Free && c.View.Rect().Min().X < hr.Max().X {
+			// zlog.Info("Add:", c.View.ObjectName(), c.View.Rect().Max().X, hr.Max().X)
+			cells = append(cells, c)
+		} else {
+			// zlog.Info("Collapsed:", c.View.Native().IsShown(), c.View.ObjectName(), c.View.Rect().Size, c.ShowIfExtraSpace)
+		}
+	}
+	var hviews []zview.View
+	for _, c := range v.Cells {
+		if !c.Collapsed && !c.Free {
+			// if c.View.Rect().Size.W == 0 || c.View.ObjectName() == "CPU" {
+			// 	zlog.Info("!Add:", c.View.ObjectName(), c.View.Rect().Size, c.ShowIfExtraSpace)
+			// }
+			hviews = append(hviews, c.View)
+		}
+	}
+	// if len(cells) != len(hviews) {
+	// 	return
+	// }
+	// zlog.Assert(len(cells) == len(hviews), len(cells), len(hviews), stack.Hierarchy())
+	x := hr.Pos.X
+	for i := range cells {
+		cr := cells[i].View.Rect()
+		o := cr
+		o.Pos.X = x
+		if i == len(cells)-1 {
+			x = hr.Max().X
+			// zlog.Info("Hv.Fit2RowStart:", stack.Rect().Size.W, "x:", x, o.Pos.X, cr.Size.W)
+		} else {
+			x = (cr.Max().X+cells[i+1].View.Rect().Min().X)/2 + xdiff
+		}
+		zfloat.Maximize(&x, o.Pos.X+cr.Size.W) // Hack on initial setup where no data in table yet
+		zfloat.Minimize(&x, hr.Max().X)        // It can get too wide, so limit to max. cells in each row should probably be clipped instead.
+		o.SetMaxX(x)
+		o.Pos.Y = 0
+		o.Size.H = hr.Size.H
+		if o.Size.W != 0 {
+			for j, hv := range hviews {
+				if hv != nil && hv.ObjectName() == cells[i].View.ObjectName() {
+					hv.SetRect(o)
+					hv.Show(true)
+					hviews[j] = nil
+					break
+				}
+			}
+		}
+	}
+	for _, hv := range hviews {
+		if hv != nil {
+			hv.SetRect(zgeo.RectFromXYWH(-100, 0, 20, 16)) // If we don't set their rect, they don't draw when shown
+			hv.Show(false)
+		}
+	}
+}
+
+func (v *HeaderView) ColumnView(id string) *zshape.ImageButtonView {
+	view, _ := v.FindViewWithName(id, false)
+	if view != nil {
+		return view.(*zshape.ImageButtonView)
+	}
+	return nil
+}
+
+func (v *HeaderView) RightColumn() *zshape.ImageButtonView {
+	for i := len(v.Cells) - 1; i >= 0; i-- {
+		if v.Cells[i].Free {
+			continue
+		}
+		b, _ := v.Cells[i].View.(*zshape.ImageButtonView)
+		if b != nil {
+			return b
+		}
+	}
+	return nil
+}
+
+func (v *HeaderView) ArrangeChildren() {
+	// We purpously don't do anything here, as we want FitToRowStack to arrange us
+}
+
+func (v *HeaderView) GetSearchableItems(currentPath []zdocs.PathPart) []zdocs.SearchableItem {
+	var parts []zdocs.SearchableItem
+	headerPath := zdocs.AddedPath(currentPath, zdocs.StaticField, "Header", "Header")
+	for _, c := range v.Cells {
+		if c.View != nil && c.View.Native().IsSearchable() && v.Native().IsShown() {
+			sig, _ := c.View.(zdocs.SearchableItemsGetter)
+			if sig != nil {
+				items := sig.GetSearchableItems(headerPath)
+				parts = append(parts, items...)
+			}
+		}
+	}
+	return parts
+}

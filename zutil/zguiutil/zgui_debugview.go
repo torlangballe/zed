@@ -1,0 +1,157 @@
+//go:build zui
+
+package zguiutil
+
+import (
+	"bytes"
+	"runtime/pprof"
+
+	"github.com/torlangballe/zed/zui/zapp"
+	"github.com/torlangballe/zed/zui/zbutton"
+	"github.com/torlangballe/zed/zui/zclipboard"
+	"github.com/torlangballe/zed/zui/zcontainer"
+	"github.com/torlangballe/zed/zui/zkeyboard"
+	"github.com/torlangballe/zed/zui/zlabel"
+	"github.com/torlangballe/zed/zui/zpresent"
+	"github.com/torlangballe/zed/zui/zview"
+	"github.com/torlangballe/zed/zui/zwidgets"
+	"github.com/torlangballe/zed/zutil/zdebug"
+	"github.com/torlangballe/zed/zutil/zdevice"
+	"github.com/torlangballe/zed/zutil/zfile"
+	"github.com/torlangballe/zed/zutil/zgeo"
+	"github.com/torlangballe/zed/zutil/zgraphana"
+	"github.com/torlangballe/zed/zutil/zhttp"
+	"github.com/torlangballe/zed/zutil/zlog"
+	"github.com/torlangballe/zed/zutil/zrest"
+	"github.com/torlangballe/zed/zutil/ztimer"
+)
+
+type DebugView struct {
+	zcontainer.StackView
+}
+
+func addRow(in *zcontainer.StackView, name, ptype string) (*zbutton.Button, *zlabel.Label, *zwidgets.ActivityView) {
+	var activity *zwidgets.ActivityView
+	v := zcontainer.StackViewHor(name + "-stack")
+	button := zbutton.New("download " + name)
+	v.Add(button, zgeo.CenterLeft)
+	down := "<download-folder>"
+	if zdevice.WasmBrowser() == zdevice.Safari {
+		down = "~/Downloads"
+	}
+	then := zlabel.New("then")
+	then.SetFont(zgeo.FontDefault(0).NewWithStyle(zgeo.FontStyleBold))
+	v.Add(then, zgeo.CenterLeft)
+	label := zlabel.New("go tool pprof -web " + down + "/" + name)
+	label.SetPressWithModifierToClipboard(zkeyboard.ModifierNone)
+	v.Add(label, zgeo.CenterLeft)
+	in.Add(v, zgeo.CenterLeft|zgeo.HorExpand)
+
+	if name == "cpu" {
+		activity = zwidgets.NewActivityView(zgeo.SizeBoth(14), zgeo.ColorBlack)
+		v.Add(activity, zgeo.CenterLeft)
+	}
+	return button, label, activity
+}
+
+func addGUIRow(in *zcontainer.StackView, name, ptype string) {
+	button, _, _ := addRow(in, name, ptype)
+	button.SetPressedHandler("", zkeyboard.ModifierNone, func() {
+		out := bytes.NewBuffer([]byte{})
+		prof := pprof.Lookup(ptype)
+		prof.WriteTo(out, 0)
+		data := out.Bytes()
+		uri := zhttp.MakeDataURL(data, "application/octet-stream")
+		zview.DownloadURI(uri, ptype)
+	})
+}
+
+func addDownloadRow(in *zcontainer.StackView, ip, name, ptype string) {
+	button, _, activity := addRow(in, name, ptype)
+	surl := zapp.URLStub()
+	if ip != "" {
+		u := zapp.URL() // for scheme+port
+		u.Path = ""
+		u.RawQuery = ""
+		u.Host = ip
+		surl = u.String()
+	}
+	surl += zrest.AppURLPrefix + zdebug.ProfilingURLPrefix + ptype // must be here and not in closure below!
+	button.SetToolTip(surl)
+	button.SetPressedHandler("", zkeyboard.ModifierAlt, func() {
+		str := "curl " + surl + " > " + name + " && go tool pprof -web " + name
+		zclipboard.SetString(str)
+		return
+	})
+	button.SetPressedHandler("", zkeyboard.ModifierNone, func() {
+		if activity != nil {
+			activity.Start()
+			ztimer.StartIn(10, activity.Stop)
+		}
+		zlog.Info("Download", surl, name)
+		go zview.DownloadURI(surl, name)
+	})
+}
+
+func makeFrame(in *zcontainer.StackView, name string) (frame, header *zcontainer.StackView) {
+	frame = zcontainer.StackViewVert("other")
+	header = MakeStackATitledFrame(frame, name, true, false, DefaultFrameStyling, DefaultFrameTitleStyling)
+	in.Add(frame, zgeo.CenterLeft|zgeo.HorExpand)
+	return frame, header
+}
+
+func NewDebugView(urlStub string, otherIPs map[string]string, serverName string) *DebugView {
+	v := &DebugView{}
+	v.SetMarginS(zgeo.SizeD(10, 10))
+	v.Init(v, true, "debug-view")
+	frame, _ := makeFrame(&v.StackView, "gui")
+	addGUIRow(frame, "gui-heap", "heap")
+	frame, _ = makeFrame(&v.StackView, "manager")
+	for _, name := range zdebug.AllProfileTypes {
+		addDownloadRow(frame, "", name, name)
+	}
+	for device, ip := range otherIPs {
+		frame, _ = makeFrame(&v.StackView, device)
+		for _, name := range []string{"heap", "cpu"} {
+			addDownloadRow(frame, ip, name, name)
+		}
+	}
+	frame, _ = makeFrame(&v.StackView, "Enable GUI named log sections")
+	var header *zcontainer.StackView
+	frame, header = makeFrame(&v.StackView, "Telemetry")
+	grid := zcontainer.NewGridView("options", 2)
+	grid.Spacing.H = 0
+	frame.Add(grid, zgeo.TopLeft|zgeo.Expand)
+	AddKVOptionToGrid(grid, zgraphana.APIKey)
+	AddKVOptionToGrid(grid, zgraphana.URLPrefix)
+	AddKVOptionToGrid(grid, zgraphana.DashboardUID)
+	link := zlabel.NewLink("dashboard", "", true)
+	header.Add(link, zgeo.CenterRight)
+	timer := ztimer.RepeatForeverNow(1, func() {
+		pref := zgraphana.URLPrefix.Get()
+		uid := zgraphana.DashboardUID.Get()
+		var surl string
+		var args = map[string]string{
+			"theme": "dark",
+		}
+		if pref != "" && uid != "" {
+			surl = zfile.JoinPathParts(pref, "D", uid)
+			if serverName != "" {
+				args["var-job"] = serverName
+			}
+		}
+		surl, _ = zhttp.MakeURLWithArgs(surl, args)
+		link.SetURL(surl, true)
+	})
+	v.AddOnRemoveFunc(timer.Stop)
+	v.SetMinSize(zgeo.SizeF(400, 400))
+	return v
+}
+
+func PresentDebugView(urlStub string, otherIPs map[string]string, serverName string) {
+	v := NewDebugView(urlStub, otherIPs, serverName)
+	att := zpresent.AttributesDefault()
+	att.Modal = true
+	att.ModalCloseOnOutsidePress = true
+	zpresent.PresentTitledView(v, "Debug", att, nil, nil)
+}

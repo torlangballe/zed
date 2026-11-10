@@ -1,0 +1,137 @@
+//go:build zui
+
+package zmenu
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+
+	"github.com/torlangballe/zed/zui/zdocs"
+	"github.com/torlangballe/zed/zui/ztextinfo"
+	"github.com/torlangballe/zed/zui/zview"
+	"github.com/torlangballe/zed/zutil/zdevice"
+	"github.com/torlangballe/zed/zutil/zdict"
+	"github.com/torlangballe/zed/zutil/zfloat"
+	"github.com/torlangballe/zed/zutil/zgeo"
+	"github.com/torlangballe/zed/zutil/zkeyvalue"
+	"github.com/torlangballe/zed/zutil/zwords"
+)
+
+const MenuSeparatorID = "$sep"
+
+type MenuType interface {
+	UpdateItems(items zdict.Items, valuesSlicePtr any, isAction bool)
+}
+
+type MenuView struct {
+	zview.NativeView
+	StoreKey                   string
+	RowFormat                  string
+	CurrentSelectIsProgramatic bool
+	maxWidth                   float64
+	selectedHandler            func(edited bool)
+	items                      zdict.Items
+	currentValue               any
+	storeKey                   string
+}
+
+var menuViewHeight = 21.0
+
+func (v *MenuView) CurrentValue() any {
+	return v.currentValue
+}
+
+func (v *MenuView) CurrentItem() *zdict.Item {
+	for i, item := range v.items {
+		if reflect.DeepEqual(item.Value, v.currentValue) {
+			return &v.items[i]
+		}
+	}
+	return nil
+}
+
+func (v *MenuView) GetDump() string {
+	return fmt.Sprintf("%+v", v.items)
+}
+
+func (v *MenuView) getNumberOfItemsString() string {
+	return zwords.PluralWordWithCount("item", float64(v.items.Count()), "", "", 0)
+}
+
+func getRowString(format string, item zdict.Item) string {
+	if format == "" {
+		return item.Name
+	}
+	str := strings.Replace(format, "$N", item.Name, -1)
+	str = strings.Replace(str, "$V", fmt.Sprint(item.Value), -1)
+	return str
+}
+
+func (v *MenuView) CalculatedSize(total zgeo.Size) (s, max zgeo.Size) {
+	var maxStr string
+	for _, item := range v.items {
+		rowStr := getRowString(v.RowFormat, item)
+		if len(rowStr) > len(maxStr) {
+			maxStr = rowStr
+		}
+	}
+	w := ztextinfo.WidthOfString(maxStr, v.Font())
+	if v.maxWidth != 0 {
+		zfloat.Minimize(&w, v.maxWidth)
+	}
+	w += 38
+	if zdevice.OS() != zdevice.MacOSType {
+		w += 5
+	}
+	s = zgeo.SizeD(w, menuViewHeight)
+	s.H += 4 // 8
+	max = s
+	if v.maxWidth == 0 || len(v.items) == 0 {
+		max.W = 0
+	}
+	// zlog.Info("MV.CalculatedSize:", v.Hierarchy(), s, max, maxStr, len(v.items))
+	return s, max
+}
+
+func (v *MenuView) MaxWidth() float64 {
+	return v.maxWidth
+}
+
+func (v *MenuView) SetMaxWidth(max float64) {
+	v.maxWidth = max
+}
+
+func (v *MenuView) SetStoreKey(key string, def any) {
+	if zdocs.IsGettingSearchItems {
+		return
+	}
+	v.storeKey = key
+	a, got := zkeyvalue.DefaultStore.GetItemAsAny(v.storeKey)
+	if got {
+		if v.SelectWithValue(a) {
+			return
+		}
+	}
+	if len(v.items) != 0 && v.currentValue == nil {
+		v.SelectWithValue(def)
+	}
+}
+
+func (v *MenuView) GetSearchableItems(currentPath []zdocs.PathPart) []zdocs.SearchableItem {
+	var parts []zdocs.SearchableItem
+	stub := "" //v.ObjectName()
+	for _, ditem := range v.items {
+		key := zdocs.MakeSearchableItem(currentPath, zdocs.StaticField, stub, stub, ditem.Name)
+		parts = append(parts, key)
+	}
+	return parts
+}
+
+func MenuViewCurrentValue(storeKey string, def any) any {
+	a, got := zkeyvalue.DefaultStore.GetItemAsAny(storeKey)
+	if !got {
+		return def
+	}
+	return a
+}

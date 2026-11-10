@@ -1,0 +1,125 @@
+package zcache
+
+// ExpiringMap is a thread-safe map which periodically sweeps through and removes items untouched
+// longer than secsToLive. If SetStorage is called with a path, it loads, and periodically stores itself.
+// Call FlushToStorage() to save any latest entries to storage.
+
+import (
+	"time"
+
+	"github.com/torlangballe/zed/zutil/zmap"
+	"github.com/torlangballe/zed/zutil/ztime"
+	"github.com/torlangballe/zed/zutil/ztimer"
+)
+
+type element[V any] struct {
+	value   V
+	touched time.Time
+}
+
+type ExpiringMap[K comparable, V any] struct {
+	lockedMap   zmap.LockMap[K, element[V]]
+	secsToLive  float64
+	storagePath string
+	Changed     bool
+}
+
+func NewExpiringMap[K comparable, V any](secsToLive float64) *ExpiringMap[K, V] {
+	m := &ExpiringMap[K, V]{}
+	m.secsToLive = secsToLive
+	ztimer.RepeatForever(secsToLive/3, func() {
+		if !m.Changed {
+			return
+		}
+		m.lockedMap.ForEach(func(k K, e element[V]) bool {
+			if ztime.Since(e.touched) > secsToLive {
+				// zlog.Info("Expiring: Purge!", k)
+				m.lockedMap.Remove(k)
+			}
+			return true
+		})
+		m.Changed = false
+	})
+	return m
+}
+
+func (m *ExpiringMap[K, V]) Set(k K, v V) {
+	m.Changed = true
+	m.lockedMap.Set(k, element[V]{v, time.Now()})
+}
+
+func (m *ExpiringMap[K, V]) SetForever(k K, v V) {
+	m.Changed = true
+	m.lockedMap.Set(k, element[V]{v, ztime.BigTime})
+}
+
+func (m *ExpiringMap[K, V]) get(k K, touch bool) (V, bool) {
+	val, ok := m.lockedMap.Get(k)
+	if ok {
+		// zlog.Info("Peek:", k, ztime.Since(val.touched), m.secsToLive)
+		if ztime.Since(val.touched) > m.secsToLive {
+			m.lockedMap.Remove(k)
+			return val.value, false
+		} else {
+			if touch {
+				val.touched = time.Now()
+				m.lockedMap.Set(k, val)
+			}
+		}
+		return val.value, true
+	}
+	return val.value, false
+}
+
+func (m *ExpiringMap[K, V]) Get(k K) (V, bool) {
+	return m.get(k, true)
+}
+
+func (m *ExpiringMap[K, V]) Index(k K) V {
+	v, _ := m.get(k, true)
+	return v
+}
+
+func (m *ExpiringMap[K, V]) Has(k K) bool {
+	return m.lockedMap.Has(k)
+}
+
+func (m *ExpiringMap[K, V]) Peek(k K) (V, bool) {
+	return m.get(k, false)
+}
+
+func (m *ExpiringMap[K, V]) Remove(k K) {
+	m.Changed = true
+	m.lockedMap.Remove(k)
+}
+
+func (m *ExpiringMap[K, V]) RemoveAll() {
+	m.Changed = true
+	m.lockedMap.RemoveAll()
+}
+
+func (m *ExpiringMap[K, V]) ForEach(f func(key K, value V) bool) {
+	m.lockedMap.ForEach(func(key K, e element[V]) bool {
+		return f(key, e.value)
+	})
+}
+
+func (m *ExpiringMap[K, V]) ForAll(f func(key K, value V)) {
+	m.ForEach(func(key K, value V) bool {
+		f(key, value)
+		return true
+	})
+}
+
+func (m *ExpiringMap[K, V]) Count() int {
+	return m.lockedMap.Count()
+}
+
+// AddWithSetFunc adds k to m if it does not exist. Set is called once gotten or on new empty value
+func (m *ExpiringMap[K, V]) AddWithSetFunc(k K, set func(value *V, isNew bool)) bool {
+	m.Changed = true
+	v, has := m.Get(k)
+	set(&v, !has)
+	m.Set(k, v)
+	return !has
+}

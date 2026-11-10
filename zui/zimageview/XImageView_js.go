@@ -1,0 +1,129 @@
+//go:build zui
+
+package zimageview
+
+import (
+	"fmt"
+	"syscall/js"
+
+	"github.com/torlangballe/zed/zui/zcontainer"
+	"github.com/torlangballe/zed/zui/zimage"
+	"github.com/torlangballe/zed/zui/zstyle"
+	"github.com/torlangballe/zed/zui/zview"
+	"github.com/torlangballe/zed/zutil/zgeo"
+)
+
+//  Created by Tor Langballe on /20/10/15.
+
+type XImageView struct {
+	zcontainer.StackView
+	minSize       zgeo.Size
+	alignment     zgeo.Alignment
+	currentPath   string
+	hiddenOnError bool
+}
+
+func XNew(name, imagePath string, fitSize zgeo.Size) *XImageView {
+	v := &XImageView{}
+	v.Init(v, name, imagePath, fitSize)
+	return v
+}
+
+func XNew9Slice(name, imagePath string, size, capInset zgeo.Size) *XImageView {
+	v := &XImageView{}
+	v.InitWith9Slice(v, name, imagePath, size, capInset)
+	return v
+}
+
+func (v *XImageView) Init(view zview.View, name string, imagePath string, fitSize zgeo.Size) {
+	v.StackView.Init(view, false, name+"#type:img")
+	v.minSize = fitSize
+	v.SetJSStyle("object-fit", "contain")
+	v.SetCanTabFocus(false)
+	v.alignment = zgeo.Center | zgeo.Proportional
+	v.SetListenerJSFunc("error:zinit", func(this js.Value, args []js.Value) any {
+		v.SetJSStyle("display", "none")
+		v.hiddenOnError = true
+		return nil
+	})
+	v.SetURL(imagePath)
+}
+
+func (v *XImageView) InitWith9Slice(view zview.View, name string, imagePath string, size, capInset zgeo.Size) {
+	v.StackView.Init(view, false, name)
+	v.minSize = size
+	zstyle.SetStyleAs9Slice(&v.NativeView, imagePath, capInset)
+	v.SetCanTabFocus(false)
+	v.alignment = zgeo.Center | zgeo.Proportional
+}
+
+func (v *XImageView) SetDefaultLightenAmountForMode() {
+	v.SetLightenAmountForMode(0.5)
+}
+
+func (v *XImageView) SetLightenAmountForMode(amount float64) {
+	if zstyle.Dark {
+		v.JSSet("filter", fmt.Sprintf("brightness(%.2f)", 1+amount))
+	}
+}
+
+func (v *XImageView) CalculatedSize(total zgeo.Size) (s, max zgeo.Size) {
+	// zlog.Info("IV CS", v.Hierarchy(), s, p, v.image != nil, zlog.GetCallingStackString())
+	// margSize := v.Margin().Size
+	if !v.minSize.IsNull() {
+		s = v.minSize
+		// s = s.ShrunkInto(v.fitSize.Plus(margSize))
+	}
+	// if !v.minSize.IsNull() {
+	// 	ms := v.minSize.Plus(margSize)
+	// 	if s.IsNull() || v.alignment&zgeo.Proportional == 0 {
+	// 		s = ms
+	// 	} else {
+	// 		s = s.ExpandedInto(ms)
+	// 	}
+	// }
+	// s.Add(margSize.Negative())
+	s.Maximize(zgeo.SizeD(2, 2))
+	return s, s
+}
+
+func (v *XImageView) MinSize() zgeo.Size {
+	return v.minSize
+}
+
+func (v *XImageView) SetMinSize(s zgeo.Size) {
+	v.minSize = s
+}
+
+// func (v *XImageView) Alignment() zgeo.Alignment {
+// 	return v.alignment
+// }
+
+// func (v *XImageView) SetAlignment(a zgeo.Alignment) {
+// 	v.alignment = a
+// }
+
+func (v *XImageView) SetURL(path string) {
+	path = zstyle.ChangedImagePathBasedOnDarkTags(path)
+	if v.currentPath != path {
+		v.JSSet("src", path)
+		if v.hiddenOnError || v.currentPath == "" {
+			v.hiddenOnError = false
+			v.SetJSStyle("display", "visible")
+		}
+		v.currentPath = path
+	}
+}
+
+func (v *XImageView) SetImage(image *zimage.Image, path string, got func(i *zimage.Image)) {
+	v.SetURL(path)
+}
+
+func (v *XImageView) GetImage() *zimage.Image {
+	return nil
+}
+
+func (v *XImageView) SetStroke(width float64, c zgeo.Color, inset bool) {
+	v.SetNativePadding(zgeo.RectFromMarginSize(zgeo.SizeBoth(width)))
+	v.NativeView.SetStroke(width, c, inset)
+}

@@ -1,0 +1,282 @@
+//go:build server
+
+package zusers
+
+import (
+	"fmt"
+	"math/rand"
+	"net/http"
+
+	"github.com/torlangballe/zed/zutil/zcache"
+	"github.com/torlangballe/zed/zutil/zhttp"
+	"github.com/torlangballe/zed/zutil/zlog"
+	"github.com/torlangballe/zed/zutil/zmail"
+	"github.com/torlangballe/zed/zutil/znamedfuncs"
+	"github.com/torlangballe/zed/zutil/znet"
+	"github.com/torlangballe/zed/zutil/zsql"
+	"github.com/torlangballe/zed/zutil/zstr"
+)
+
+// https://github.com/go-webauthn/webauthn -- for passwordless  Web Authentication public key login
+// https://css-tricks.com/passkeys-what-the-heck-and-why/
+
+type UsersCalls struct{}
+
+type ForgotPasswordData struct {
+	MailAuth    zmail.Authentication
+	ProductName string
+	URL         string
+	From        zmail.Address
+}
+
+var (
+	MainServer               *SQLServer
+	resetCache               = zcache.NewWithExpiry(60*10, false) // cache of reset-token:email
+	StoreAuthenticationError = fmt.Errorf("Store authentication failed: %w", AuthFailedError)
+	NoTokenError             = fmt.Errorf("no token for user: %w", AuthFailedError)
+	ForgotPassword           = ForgotPasswordData{ProductName: "This service"}
+	temporaryTokens          = zcache.NewExpiringMap[int64, int64](60) // temporaryTokens are tokens that map to a userid, granting that token access as that user for 60 seconds
+	authenticator            znet.TokenAuthenticator
+)
+
+func setupWithSQLServer(s *SQLServer, executor znamedfuncs.Executioner) {
+	MainServer = s
+	if executor == nil {
+		return
+	}
+	authenticator = executor.GetAuthenticator()
+	executor.Register(UsersCalls{})
+	executor.SetAuthNotNeededForMethod("UsersCalls.GetUserSessionForToken")
+	executor.SetAuthNotNeededForMethod("UsersCalls.Authenticate")
+	executor.SetAuthNotNeededForMethod("UsersCalls.SendForgotPasswordPasswordMail")
+	executor.SetAuthNotNeededForMethod("UsersCalls.SetNewPasswordFromForgotPassword")
+	zsql.GetUserIDFromTokenFunc = MainServer.GetUserIDFromToken
+}
+
+func (UsersCalls) GetUserIDFromToken(token string, id *int64) error {
+	uid, err := MainServer.GetUserIDFromToken(token)
+	if err != nil {
+		return err
+	}
+	*id = uid
+	return nil
+}
+
+func (UsersCalls) GetUserSessionForToken(ci *znamedfuncs.ClientInfo, token string, us *UserSession) error {
+	return GetUserSessionForToken(token, us, ci.Request)
+}
+
+func GetUserSessionForToken(token string, us *UserSession, req *http.Request) error {
+	if MainServer == nil {
+		return nil
+	}
+	usession, err := MainServer.GetUserSessionForToken(token)
+	if err != nil {
+		if authenticator == nil || req == nil {
+			return err
+		}
+		valid, _ := authenticator.IsTokenValid("", req) // Authenticates with Request instead??
+		if valid {
+			*us = usession
+			return nil
+		}
+	}
+	*us = usession
+	return nil
+}
+
+func (UsersCalls) Logout(ci *znamedfuncs.ClientInfo, username string) error {
+	if MainServer == nil {
+		return nil
+	}
+	return MainServer.UnauthenticateToken(ci.Token)
+}
+
+func (UsersCalls) Authenticate(ci *znamedfuncs.ClientInfo, a Authentication, ui *ClientUserInfo) error {
+	zlog.Info("UC.Authenticate:", ui)
+	if MainServer == nil {
+		return nil
+	}
+	var err error
+	makeToken := true
+	if a.IsRegister {
+		if !AllowRegistration {
+			fail := true
+			if ci.Token != "" {
+				us, err := MainServer.GetUserSessionForToken(ci.Token)
+				fail = !(err == nil && IsAdmin(us.User.Permissions))
+			}
+			if fail {
+				return zlog.NewError("registration not allowed")
+			}
+			makeToken = false
+		}
+		ui.UserID, ui.Token, err = MainServer.RegisterUser(ci, a.UserName, a.Password, makeToken)
+		ui.UserName = a.UserName
+		ui.Permissions = []string{} // nothing yet, we just registered
+	} else {
+		ci.Token = "" // clear any old token already stored, so Login generates a new one
+		*ui, err = MainServer.Login(ci, a.UserName, a.Password)
+		zlog.Info("Login:", ui, err)
+	}
+	if err != nil {
+		zlog.Error("authenticate", a, a.IsRegister, err)
+		return err
+	}
+	return nil
+}
+
+func (UsersCalls) SendForgotPasswordPasswordMail(email string) error {
+	if MainServer == nil {
+		return nil
+	}
+	var m zmail.Mail
+	random := zstr.GenerateRandomHexBytes(16)
+	surl, _ := zhttp.MakeURLWithArgs(ForgotPassword.URL, map[string]string{
+		"reset": random,
+		"email": email,
+	})
+	m.From.Name = "Tor Langballe"
+	m.AddTo("", email)
+	m.Subject = "Reset password for " + ForgotPassword.ProductName
+	m.TextContent = "Click here to reset your password:\n\n" + surl
+	// err := m.SendWithSMTP(ForgotPassword.MailAuth)
+	err := m.Send(ForgotPassword.MailAuth)
+	if err == nil {
+		zlog.Error("forgot password send error:", m, ForgotPassword.MailAuth, err)
+		resetCache.Put(random, email)
+	}
+	return err
+}
+
+func (UsersCalls) SetNewPasswordFromForgotPassword(ci *znamedfuncs.ClientInfo, reset ResetPassword, token *string) error {
+	if MainServer == nil {
+		return nil
+	}
+	var email string
+	got := resetCache.Get(&email, reset.ResetToken)
+	if !got {
+		zlog.Error("no reset initiated:", reset.ResetToken)
+		return zlog.NewError("No reset initiated. Maybe you waited more than 10 minutes.")
+	}
+	u, err := MainServer.GetUserForUserName(email)
+	if err != nil {
+		zlog.Error("no user", err)
+		return zlog.NewError("No user for that reset link")
+	}
+	resetCache.Remove(reset.ResetToken)
+	var change ChangeInfo
+	change.NewString = reset.Password
+	change.UserID = u.ID
+	err = UsersCalls{}.ChangePasswordForSelf(ci, change, token)
+	return err
+}
+
+func (UsersCalls) ChangePasswordForSelf(ci *znamedfuncs.ClientInfo, change ChangeInfo, token *string) error {
+	if MainServer == nil {
+		return nil
+	}
+	var err error
+	*token, err = MainServer.ChangePasswordForUser(ci, change.UserID, change.NewString)
+	return err
+}
+
+func (UsersCalls) ChangeUserNameForSelf(ci *znamedfuncs.ClientInfo, change ChangeInfo) error {
+	if MainServer == nil {
+		return nil
+	}
+	return MainServer.ChangeUserNameForUser(change.UserID, change.NewString)
+}
+
+func (UsersCalls) GetAllUsers(in *struct{}, us *[]User) error {
+	if MainServer == nil {
+		return nil
+	}
+	var err error
+	*us, err = MainServer.GetAllUsers()
+	return err
+}
+
+func (UsersCalls) DeleteUserForID(id int64) error {
+	if MainServer == nil {
+		return nil
+	}
+	return MainServer.DeleteUserForID(id)
+}
+
+func (UsersCalls) ChangeUsersUserNameAndPermissions(ci *znamedfuncs.ClientInfo, change ClientUserInfo) error {
+	if MainServer == nil {
+		return nil
+	}
+	callingUserSession, err := MainServer.GetUserSessionForToken(ci.Token)
+	if err != nil {
+		return zlog.Error("getting admin user", err)
+	}
+	if !callingUserSession.User.IsAdmin() {
+		return zlog.Error("change user name / permissions: must be done my admin user", err)
+	}
+	changeUser, err := MainServer.GetUserForID(change.UserID)
+	if err != nil {
+		return zlog.Error("getting change user", err)
+	}
+	err = MainServer.ChangeUsersUserNameAndPermissions(ci, change)
+	if err != nil {
+		return err
+	}
+	if !zstr.SlicesHaveSameValues(change.Permissions, changeUser.Permissions) {
+		err = MainServer.UnauthenticateUser(change.UserID)
+		if err != nil {
+			zlog.Error("UnauthenticateUser", err)
+		}
+	}
+	return nil
+}
+
+func (UsersCalls) UnauthenticateUser(ci *znamedfuncs.ClientInfo, userID int64) error {
+	if MainServer == nil {
+		return nil
+	}
+	zlog.Info("US.UnauthenticateUser")
+	callingUserSession, err := MainServer.GetUserSessionForToken(ci.Token)
+	if err != nil {
+		return zlog.Error("getting admin user", err)
+	}
+	if !callingUserSession.User.IsAdmin() {
+		return zlog.Error("unauthenticating other user: must be done my admin user", err)
+	}
+	err = MainServer.UnauthenticateUser(userID)
+	if err != nil {
+		zlog.Error("UnauthenticateUser", err)
+	}
+	return nil
+}
+
+func RegisterDefaultAdminUserIfNone() {
+	var us []User
+	var hasAdmin bool
+	err := UsersCalls{}.GetAllUsers(nil, &us)
+	for _, u := range us {
+		if u.IsAdmin() {
+			hasAdmin = true
+		}
+	}
+	if err == nil && !hasAdmin && DefaultUserName != "" {
+		zlog.Info("RegisterDefaultAdminUserIfNone", err)
+		userID, _, _ := MainServer.RegisterUser(nil, DefaultUserName, DefaultPassword, false)
+		MainServer.SetAdminForUser(userID, true)
+	}
+}
+
+func AddTemporatyToken(userID int64) (token int64) {
+	token = rand.Int63()
+	temporaryTokens.Set(token, userID)
+	return token
+}
+
+func PopTemporaryToken(token int64) (userID int64, got bool) {
+	userID, got = temporaryTokens.Get(token)
+	if got {
+		temporaryTokens.Remove(token)
+	}
+	return userID, got
+}

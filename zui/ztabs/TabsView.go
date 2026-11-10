@@ -1,0 +1,400 @@
+//go:build zui
+
+package ztabs
+
+import (
+	"github.com/torlangballe/zed/zui/zcanvas"
+	"github.com/torlangballe/zed/zui/zcontainer"
+	"github.com/torlangballe/zed/zui/zcursor"
+	"github.com/torlangballe/zed/zui/zcustom"
+	"github.com/torlangballe/zed/zui/zdocs"
+	"github.com/torlangballe/zed/zui/zkeyboard"
+	"github.com/torlangballe/zed/zui/zshape"
+	"github.com/torlangballe/zed/zui/zstyle"
+	"github.com/torlangballe/zed/zui/zview"
+	"github.com/torlangballe/zed/zutil/zgeo"
+	"github.com/torlangballe/zed/zutil/zkeyvalue"
+	"github.com/torlangballe/zed/zutil/zlog"
+	"github.com/torlangballe/zed/zutil/zslices"
+	"github.com/torlangballe/zed/zutil/zstr"
+	"github.com/torlangballe/zed/zutil/ztimer"
+)
+
+type CreateType int
+
+const (
+	Create CreateType = iota + 1
+	Delete
+)
+
+type Item struct {
+	id        string
+	title     string
+	view      zview.View
+	SlowStart bool // SlowStart shows a wait cursor before changing the view in a goroutine, so cursor can kick in.
+	create    func(id string, ctype CreateType) zview.View
+}
+
+type TabsView struct {
+	zcontainer.StackView
+	separatorForIDs       []string
+	SeparatorLineInset    float64
+	ButtonName            string //
+	selectedImageBGColor  zgeo.Color
+	MaxImageSize          zgeo.Size
+	InvertSelectedTabText bool
+	CurrentID             string
+	DefaultID             string
+	Header                *zcontainer.StackView
+
+	storeKey           string
+	items              []Item
+	currentChild       zview.View
+	ChangedHandlerFunc func(newID string)
+}
+
+const (
+	tabSeparatorID = "tab-separator"
+	storeKeyPrefix = "zui.TabsView.CurrentID."
+)
+
+var (
+	DefaultButtonName           = "gray-tab{-dark?}"
+	DefaultTextColor            = zstyle.GrayCur(0.1, 0.9)
+	DefaultSelectedImageBGColor = zstyle.ColCur(zgeo.ColorNew(0, 0, 1, 0.2), zgeo.ColorNew(0, 0, 9, 0.2))
+)
+
+func TabsViewNew(storeName string, buttons bool) *TabsView {
+	v := &TabsView{}
+	v.StackView.Init(v, true, storeName)
+	v.SetBGColor(zstyle.DefaultBGColor())
+	v.SetSpacing(0) // note: for vertical stack v
+	v.Header = zcontainer.StackViewHor("header")
+	v.Header.SetBGColor(zgeo.ColorClear)
+	if buttons {
+		v.ButtonName = DefaultButtonName
+		v.Header.SetMargin(zgeo.RectFromXY2(2, 4, 0, 0))
+	} else {
+		v.MaxImageSize = zgeo.SizeD(60, 24)
+		v.Header.SetMargin(zgeo.RectFromXY2(8, 6, -8, -6))
+	}
+	v.storeKey = storeName
+	if storeName != "" {
+		str, got := zkeyvalue.DefaultStore.GetString(storeKeyPrefix + storeName)
+		if got {
+			v.CurrentID = str
+		}
+	}
+	v.Header.SetSpacing(12) // note: for header
+	v.Add(v.Header, zgeo.Left|zgeo.Top|zgeo.HorExpand)
+	v.selectedImageBGColor = DefaultSelectedImageBGColor()
+	// v.SetIndicatorSelectionFunc = v.setButtonOn
+	if !buttons {
+		v.Header.SetDrawHandler(func(rect zgeo.Rect, canvas *zcanvas.Canvas, view zview.View) {
+			sv, i := v.Header.FindViewWithName(v.CurrentID, false)
+			if sv != nil {
+				r := sv.Rect()
+				r.Pos.Y = 0
+				r.Size.H = rect.Size.H
+				r.SetMinX(r.Min().X - v.Header.Spacing()/2)
+				r.SetMaxX(r.Max().X + v.Header.Spacing()/2)
+				if i == 0 {
+					r.SetMinX(rect.Min().X)
+				}
+				if i == v.Header.CountChildren() && r.Max().X > rect.Max().X-8 {
+					r.SetMaxX(rect.Max().X)
+				}
+				canvas.SetColor(v.selectedImageBGColor)
+				path := zgeo.PathNewRect(r, zgeo.SizeNull)
+				canvas.FillPath(path)
+			}
+		})
+	}
+	// v.SetKeyHandler(func(km zkeyboard.KeyMod, down bool) bool {
+	// 	if !down {
+	// 		return false
+	// 	}
+	// 	zlog.Info("TabKey:", v.IsInAFocusedView())
+	// 	return zshortcuts.HandleShortcut(v, km, v.IsInAFocusedView())
+	// })
+	return v
+}
+
+func (v *TabsView) ReadyToShow(beforeWindow bool) {
+	if !beforeWindow {
+		return
+	}
+	defID := v.DefaultID
+	if defID == "" && len(v.items) > 0 {
+		defID = v.items[0].id
+	}
+	if v.CurrentID == "" && defID != "" {
+		v.SelectItem(defID, nil)
+	}
+	for _, item := range v.items {
+		v.setButtonOn(item.id, item.id == v.CurrentID)
+	}
+}
+
+// AddItem adds a new tab to the row of tabs.
+// id is unique id that identifies it.
+// title is what's written in the tab, if ButtonName != "".
+// ipath is path to image, if ButtonName != "" shown on right, otherwise centered
+// set makes it the current tab after adding
+// view/create are either the view to show for this tab, or how to make/delete it dynamically.
+// It is added/removed from view hierarchy by this method.
+// create is a function to create or delete the content child each time tab is set.
+func (v *TabsView) AddItem(id, title, imagePath string, view zview.View, create func(id string, ctype CreateType) zview.View) *Item {
+	// v.AddGroupItem(id, title, imagePath, set, view, create)
+	var button *zshape.ShapeView
+	minSize := zgeo.SizeD(20, 22)
+	if title == "" {
+		title = id
+	}
+	if v.ButtonName != "" {
+		// zlog.Info("Add Tab button:", title, v.ButtonName)
+		b := zshape.ImageButtonViewNew(title, v.ButtonName, minSize, zgeo.SizeD(11, 8))
+		button = &b.ShapeView
+		button.SetTextColor(DefaultTextColor())
+		button.SetMarginS(zgeo.SizeD(10, 0))
+		button.SetFont(zgeo.FontNice(zgeo.FontDefaultSize, zgeo.FontStyleNormal))
+		view = b
+	} else {
+		button = zshape.NewView(zshape.TypeNone, minSize)
+		button.MaxSize = v.MaxImageSize
+		button.ImageMargin = zgeo.RectNull
+		view = button
+	}
+	button.MaxSize.H = 26
+	button.SetObjectName(id)
+	// if imagePath != "" {
+	// 	button.SetImage(nil, true, zgeo.SizeNull, imagePath, zgeo.SizeNull, nil)
+	// }
+	button.SetPressedHandler("", zkeyboard.ModifierAny, func() {
+		i := v.FindItem(id)
+		item := v.items[i]
+		if !item.SlowStart {
+			v.SelectItem(id, nil)
+			return
+		}
+		v.SetCursor(zcursor.Wait)
+		ztimer.StartIn(0.1, func() {
+			v.SelectItem(id, nil)
+			v.SetCursor(zcursor.Default)
+		})
+	})
+	v.Header.Add(view, zgeo.BottomLeft)
+	v.items = append(v.items, Item{id: id, create: create, title: title})
+	ilen := len(v.items)
+	if ilen < 10 {
+		key := zkeyboard.Key('0' + ilen)
+		button.KeyboardShortcut.KeyMod = zkeyboard.KMod(key, 0)
+		button.KeyboardShortcut.NoNeedFocus = true
+	}
+	if v.CurrentID == id {
+		v.SelectItem(id, nil)
+	}
+	return &v.items[len(v.items)-1]
+}
+
+func (v *TabsView) SelectItem(id string, done func()) bool {
+	return v.SelectOrReloadItem(id, false, done)
+}
+
+func (v *TabsView) SelectOrReloadItem(id string, reloadIfAlreadySelected bool, done func()) bool {
+	prof := zlog.NewProfile(0.7, "Tabs.Load")
+	prof.Log("start")
+	defer prof.End("End")
+
+	ni := v.FindItem(id)
+	if ni == -1 {
+		return false
+	}
+	if v.CurrentID == id && v.FindItem(id) != -1 && v.currentChild != nil {
+		if reloadIfAlreadySelected {
+			i := v.FindItem(id)
+			item := v.items[i]
+			if item.create != nil {
+				item.create(id, Delete)
+				v.items[i].view = nil
+			}
+			v.RemoveChild(v.currentChild, true)
+			v.currentChild = nil
+			v.SelectItem(id, done)
+			return true
+		}
+		if done != nil {
+			done()
+		}
+		return true
+	}
+	ci := v.FindItem(v.CurrentID)
+	if ci != -1 && v.currentChild != nil {
+		item := v.items[ci]
+		item.create(v.CurrentID, Delete)
+		v.items[ci].view = nil
+	}
+	if v.currentChild != nil {
+		v.RemoveChild(v.currentChild, true)
+		v.currentChild = nil
+	}
+	if v.CurrentID != "" {
+		v.setButtonOn(v.CurrentID, false)
+	}
+	v.CurrentID = id
+	if v.storeKey != "" {
+		zkeyvalue.DefaultStore.SetString(v.CurrentID, storeKeyPrefix+v.storeKey, true)
+	}
+	v.setButtonOn(v.CurrentID, true)
+	item := v.items[ni]
+	v.currentChild = item.view
+	if item.create != nil {
+		v.currentChild = item.create(id, Create)
+		v.items[ni].view = v.currentChild
+	}
+	//	v.Add(v.currentChild, zgeo.TopLeft|zgeo.Expand)
+	marg := zgeo.Size{}
+	if v.currentChild.Native().CanTabFocus() {
+		marg = zgeo.SizeBoth(3)
+	}
+	prof.Log("Before add")
+	v.Add(v.currentChild, zgeo.Center|zgeo.Expand, marg)
+	prof.Log("After add")
+	hasSeparator := zstr.StringsContain(v.separatorForIDs, id)
+	arrange := false
+	v.CollapseChildWithName(tabSeparatorID, !hasSeparator, arrange)
+	if v.IsPresented() {
+		prof.Log("Before arrange")
+		zcontainer.ArrangeAncestorContainer(v)
+	}
+	prof.Log("After Ancestor")
+	if v.ChangedHandlerFunc != nil {
+		v.ChangedHandlerFunc(id)
+	}
+	if done != nil {
+		done()
+	}
+	prof.Log("After done")
+	ztimer.StartIn(0.02, func() {
+		v.SetRootYContentOffset(0) // in case old tab's view caused scroll offset, set back to 0
+	})
+	return true
+}
+
+func (v *TabsView) RemoveItem(id string) {
+	i := v.FindItem(id)
+	zslices.RemoveAt(&v.items, i)
+	item := v.items[i]
+	if item.create != nil {
+		item.create(id, Delete)
+		v.items[i].view = nil
+	}
+	if v.currentChild != nil {
+		v.RemoveChild(v.currentChild, true)
+		v.currentChild = nil
+	}
+}
+
+func (v *TabsView) AddSeparatorLine(thickness float64, color zgeo.Color, corner float64, forIDs []string) {
+	cv := zcustom.NewView(tabSeparatorID)
+	cv.SetMinSize(zgeo.SizeD(10, thickness))
+	cv.SetDrawHandler(func(rect zgeo.Rect, canvas *zcanvas.Canvas, view zview.View) {
+		selectedView, _ := v.Header.FindViewWithName(v.CurrentID, false)
+		canvas.SetColor(color)
+		if selectedView != nil {
+			r := selectedView.Rect()
+			x0 := r.Pos.X + v.SeparatorLineInset
+			x1 := r.Max().X - v.SeparatorLineInset
+			r = rect
+			r.SetMaxX(x0)
+			path := zgeo.PathNewRect(r, zgeo.SizeNull)
+			canvas.FillPath(path)
+			r = rect
+			r.SetMinX(x1)
+			path = zgeo.PathNewRect(r, zgeo.SizeNull)
+			canvas.FillPath(path)
+		} else {
+			path := zgeo.PathNewRect(rect, zgeo.SizeNull)
+			canvas.FillPath(path)
+		}
+	})
+	v.Add(cv, zgeo.TopLeft|zgeo.HorExpand)
+	v.separatorForIDs = forIDs
+}
+
+func (v *TabsView) FindItem(id string) int {
+	for i := range v.items {
+		if v.items[i].id == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func (v *TabsView) setButtonOn(id string, selected bool) {
+	view, _ := v.Header.FindViewWithName(id, false)
+	if view != nil {
+		button, _ := view.(*zshape.ImageButtonView)
+		if button != nil {
+			str := DefaultButtonName
+			if selected {
+				str += "-selected"
+			}
+			button.SetImageName(str, zgeo.SizeD(11, 8))
+			col := DefaultTextColor()
+			if v.InvertSelectedTabText {
+				col = col.ContrastingGray()
+			}
+			if !selected {
+				col = col.WithOpacity(0.8)
+			}
+			button.SetTextColor(col)
+		} else { // image only
+			v.Header.Expose()
+		}
+	}
+}
+
+func (v *TabsView) SetButtonAlignment(id string, a zgeo.Alignment) {
+	cell, _ := v.Header.FindCellWithName(id)
+	cell.Alignment = a
+}
+
+func (v *TabsView) OpenGUIFromPathParts(parts []zdocs.PathPart) bool {
+	tabID := parts[0].PathStub
+	handled := v.SelectItem(tabID, nil)
+	if handled {
+		if len(parts) > 1 {
+			zlog.Assert(v.currentChild != nil)
+			o, _ := v.currentChild.(zdocs.GUIPartOpener)
+			o.OpenGUIFromPathParts(parts[1:])
+		}
+	}
+	return handled
+}
+
+func (v *TabsView) GetSearchableItems(currentPath []zdocs.PathPart) []zdocs.SearchableItem {
+	var got []zdocs.SearchableItem
+	tabPath := zdocs.AddedPath(currentPath, zdocs.StaticField, v.ObjectName(), v.ObjectName())
+	for _, item := range v.items {
+		view := item.create(item.id, Create)
+		if view.Native().IsSearchable() {
+			r, _ := view.(zview.ReadyToShowType)
+			if r != nil {
+				r.ReadyToShow(true)
+				r.ReadyToShow(false)
+			}
+			itemPath := zdocs.AddedPath(tabPath, zdocs.PressField, item.title, item.id)
+			sig, _ := view.(zdocs.SearchableItemsGetter)
+			if sig != nil {
+				add := sig.GetSearchableItems(itemPath)
+				got = append(got, add...)
+			}
+		}
+		view.Native().PerformAddRemoveFuncs(false)
+		if item.id != v.CurrentID {
+			item.create(item.id, Delete)
+		}
+	}
+	return got
+}

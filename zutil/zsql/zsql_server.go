@@ -1,0 +1,554 @@
+//go:build server
+
+package zsql
+
+import (
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"path"
+	"reflect"
+	"strings"
+
+	"github.com/lib/pq"
+	"github.com/torlangballe/zed/zutil/zfile"
+	"github.com/torlangballe/zed/zutil/zlog"
+	"github.com/torlangballe/zed/zutil/zreflect"
+	"github.com/torlangballe/zed/zutil/zstr"
+
+	_ "modernc.org/sqlite"
+	// _ "github.com/mattn/go-sqlite3"
+)
+
+// Compile mattn/go-sqlite3:
+// Install musl-cross (brew install FiloSottile/musl-cross/musl-cross).
+// Run CC=x86_64-linux-musl-gcc CXX=x86_64-linux-musl-g++ GOARCH=amd64 GOOS=linux CGO_ENABLED=1 go build -ldflags "-linkmode external -extldflags -static".
+
+type Base struct {
+	DB             *sql.DB
+	Type           BaseType
+	statementCache map[string]*sql.Stmt
+}
+
+type SQLCalls struct{}
+
+// type SQLDictSlice []zdict.Dict
+
+var (
+	Main                   Base
+	GetUserIDFromTokenFunc func(token string) (int64, error)
+)
+
+func InitMainSQLite(filePath string) error {
+	var err error
+	Main.DB, err = NewSQLite(filePath)
+	Main.Type = SQLite
+	return err
+}
+
+func NewSQLite(filePath string) (*sql.DB, error) {
+	var err error
+	dir, _, sub, ext := zfile.Split(filePath)
+	zfile.MakeDirAllIfNotExists(dir)
+	ext = ".sqlite3"
+	file := path.Join(dir, sub+ext)
+
+	db, err := sql.Open("sqlite", file+"?cache=shared")
+	if err != nil {
+		return nil, zlog.Error("open file", file, err)
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
+}
+
+// interesting: https://github.com/jmoiron/sqlx
+type Executer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+type RowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+type SQLer interface { // this is used for routines that can take a sql.Db or sql.Tx
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+var EscapeReplacer = strings.NewReplacer(
+	"\n", "\\n",
+	"\t", "\\t",
+	"\r", "\\n",
+	"'", "''")
+
+var UnescapeReplacer = strings.NewReplacer(
+	"\\n", "\n",
+	"\\t", "\t",
+	"\\r", "\n",
+	"''", "'")
+
+var LineOutputReplacer = strings.NewReplacer(
+	"\n", "\\n",
+	"\t", "\\t",
+	"\r", "\\n")
+
+func (base *Base) CustomizeQuery(query string) string {
+	return CustomizeQuery(query, base.Type)
+}
+
+// func makeAnyWithPQArrayIfSlice(rval reflect.Value, kind reflect.Kind) any {
+// 	a := rval.Interface()
+// 	if kind == reflect.Slice {
+// 		v := rval.Interface()
+// 		_, got := v.([]byte)
+// 		if !got {
+// 			_, is := v.(JSONer)
+// 			if !is {
+// 				_, is := v.(sql.Scanner)
+// 				if !is {
+// 					return pq.Array(a)
+// 				}
+// 			}
+// 		}
+// 	}
+// 	return a
+// }
+
+func FieldPointersFromStruct(istruct any, skip []string) (pointers []any) {
+	ForEachColumn(istruct, skip, "", func(each ColumnInfo) bool {
+		a := each.ReflectValue.Addr().Interface()
+		_, isScanner := a.(sql.Scanner)
+		if !isScanner && each.ReflectValue.Kind() == reflect.Slice {
+			a = pq.Array(a)
+		}
+		pointers = append(pointers, a)
+		return true
+	})
+	return
+}
+
+func FieldValuesFromStruct(istruct any, skip []string) (values []any) {
+	ForEachColumn(istruct, skip, "", func(each ColumnInfo) bool {
+		a := each.ReflectValue.Interface()
+		_, isValuer := a.(driver.Valuer)
+		// zlog.Info("FieldValuesFromStruct:", isValuer, each.ReflectValue.Kind(), each.ReflectValue.Type(), each.Column)
+		if !isValuer && each.ReflectValue.Kind() == reflect.Slice {
+			a = pq.Array(a)
+		}
+		values = append(values, a)
+		return true
+	})
+	return
+}
+
+func FieldSettingToParametersFromStruct(istruct any, skip []string, prefix string, start int) string {
+	var set string
+	var i int
+	ForEachColumn(istruct, skip, "", func(each ColumnInfo) bool {
+		if i != 0 {
+			set += ","
+		}
+		set += fmt.Sprintf("%s=$%d", prefix+each.Column, start+i)
+		i++
+		return true
+	})
+	return set
+}
+
+func NFieldParameters(start, n int) string {
+	var params string
+	for i := range n {
+		if i != 0 {
+			params += ","
+		}
+		params += fmt.Sprintf("$%d", start+i)
+	}
+	return params
+}
+
+func FieldParametersFromStruct(istruct any, skip []string, start int) string {
+	var count int
+	ForEachColumn(istruct, skip, "", func(ColumnInfo) bool {
+		count++
+		return true
+	})
+	return NFieldParameters(start, count)
+}
+
+/*
+func GetSQLTypeForReflectKind(item zreflect.Item, btype BaseType) string {
+	var stype string
+	switch item.Kind {
+	case zreflect.KindBool:
+		stype = "SMALLINT"
+	case zreflect.KindInt:
+		if btype == SQLite {
+			stype = "INTEGER"
+			break
+		}
+		switch item.BitSize {
+		case 8, 16:
+			stype = "SMALLINT"
+		case 32:
+			stype = "INT"
+		case 64:
+			stype = "BIGINT"
+		}
+	case zreflect.KindFloat:
+		stype = "REAL"
+	case zreflect.KindString:
+		stype = "TEXT"
+	case zreflect.KindByte:
+		stype = "BLOB"
+	case zreflect.KindTime:
+		stype = "DATETIME"
+	}
+	return stype
+}
+*/
+
+type FieldInfo struct {
+	Index       int
+	SQLType     string
+	IsPrimary   bool
+	Kind        zreflect.TypeKind
+	FieldName   string
+	SQLName     string
+	JSONName    string
+	SubTagParts []string
+}
+
+func FieldInfosFromStruct(istruct any, skip []string, btype BaseType) (infos []FieldInfo) {
+	/*
+		zreflect.ForEachField(structure, FlattenIfAnonymousOrZUITag, func(each zreflect.FieldInfo) bool {
+			// zlog.Info("FieldInfosFromStruct:", i, item)
+			// var name string
+			var f FieldInfo
+			parts := zreflect.GetTagAsMap(each.StructField.Tag)["db"]
+			name := ConvertFieldName(each.StructField.Name)
+			if len(parts) != 0 {
+				first := parts[0]
+				if first == "-" {
+					return true
+				}
+				f.SubTagParts = parts[1:]
+				if first != "" {
+					name = first
+				}
+			}
+			if zstr.IndexOf(name, skip) != -1 {
+				return true
+			}
+			f.IsPrimary = (zstr.IndexOf("primary", parts) != -1)
+			f.Index = each.FieldIndex
+			f.SQLName = name
+			f.SQLType = GetSQLTypeForReflectKind(item, btype)
+			f.Kind = item.Kind
+			f.FieldName = item.FieldName
+			f.JSONName = zstr.FirstToLower(item.FieldName)
+			infos = append(infos, f)
+			return true
+		})
+	*/
+	return infos
+}
+
+func CreateSQLite3TableCreateStatementFromStruct(istruct any, table string) (query string, infos []FieldInfo) {
+	infos = FieldInfosFromStruct(istruct, nil, SQLite) // hardcode SQLite for now
+	// zlog.Info("CreateSQLite3TableCreateStatementFromStruct", reflect.ValueOf(istruct).IsZero())
+	for _, f := range infos {
+		if query == "" {
+			query = "CREATE TABLE IF NOT EXISTS " + table + " (\n"
+		} else {
+			query += ",\n"
+		}
+		query += `   "` + f.SQLName + `"` + " " + f.SQLType
+		if f.IsPrimary {
+			query += " NOT NULL PRIMARY KEY AUTOINCREMENT"
+		}
+	}
+	query += "\n);"
+	return
+}
+
+func (j JSONer) Value() (driver.Value, error) {
+	// zlog.Info("JSONer Value:", string(j))
+	return driver.Value(j), nil
+}
+
+func (j *JSONer) Scan(val any) error {
+	if val == nil {
+		*j = JSONer{}
+		return nil
+	}
+	// zlog.Info("JSONB Scan", val)
+	b, ok := val.([]byte)
+	if !ok {
+		return zlog.NewError("type assertion to []byte failed", reflect.ValueOf(val).Type())
+	}
+	*j = JSONer(b)
+	return nil
+}
+
+func getSpecialColumns(row any) (primaryCol, uidCol string, pval, uval any, err error) {
+	var got int
+	ForEachColumn(row, nil, "", func(each ColumnInfo) bool {
+		// zlog.Info("Each:", each.Column, each.IsPrimary)
+		if each.IsPrimary {
+			primaryCol = each.Column
+			pval = each.ReflectValue.Interface()
+			got++
+			return got != 2
+		}
+		if each.IsUserID {
+			uidCol = each.Column
+			uval = each.ReflectValue.Interface()
+			got++
+			return got != 2
+		}
+		return true
+	})
+	return primaryCol, uidCol, pval, uval, err
+}
+
+func setUserIDInRows[S any](rows []S, uidColumn, token string) (int64, error) {
+	userID, err := GetUserIDFromTokenFunc(token)
+	if err != nil {
+		return 0, err
+	}
+	finfo, found := FieldForColumnName(rows[0], nil, "", uidColumn)
+	if !found {
+		return 0, errors.New("No userid column or UserIDSetter")
+	}
+	for i := range rows {
+		finfo := zreflect.FieldForIndex(&rows[i], nil, finfo.FieldIndex)
+		finfo.ReflectValue.SetInt(userID)
+	}
+	return userID, nil
+}
+
+func UpdateRows[S any](table string, rows []S, userToken string) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	idCol, userIDCol, id, userID, err := getSpecialColumns(rows[0])
+	if err != nil {
+		return err
+	}
+
+	skip := []string{idCol}
+	if userIDCol != "" {
+		skip = append(skip, userIDCol)
+	}
+	if userID == 0 && userToken != "" {
+		userID, err = GetUserIDFromTokenFunc(userToken)
+		if err != nil {
+			return err
+		}
+	}
+	// zlog.Info("zsql.UpdateRows:", table, len(rows))
+	for _, row := range rows {
+		set := FieldSettingToParametersFromStruct(row, skip, "", 1)
+		vals := FieldValuesFromStruct(row, skip)
+		vals = append(vals, id)
+		query := "UPDATE " + table + " SET " + set + " WHERE " + idCol + fmt.Sprintf("=$%d", len(vals))
+		if userIDCol != "" {
+			query += fmt.Sprintf(" AND %s=%v", userIDCol, userID)
+		}
+		query = CustomizeQuery(query, Main.Type)
+		_, err := Main.DB.Exec(query, vals...)
+		// zlog.Info("SQLCalls.UpdateRows2:", query, vals, err)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func InsertRows[S any](table string, rows []S, skipColumns []string, userToken string) ([]int64, error) {
+	// zlog.Info("InsertRows1:", table, len(rows))
+	var ids []int64
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	idCol, uidCol, _, _, err := getSpecialColumns(rows[0])
+	if err != nil {
+		return nil, err
+	}
+	if userToken != "" && uidCol != "" {
+		_, err = setUserIDInRows[S](rows, uidCol, userToken)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var lastID int64
+	skip := append(skipColumns, idCol)
+	params := FieldParametersFromStruct(rows[0], skip, 1)
+	query := "INSERT INTO " + table + " (" + ColumnNamesStringFromStruct(rows[0], skip, "") + ") VALUES (" + params + ") RETURNING " + idCol
+	query = CustomizeQuery(query, Main.Type)
+	// zlog.Info("InsertRows:", table, len(rows), query)
+	for _, row := range rows {
+		vals := FieldValuesFromStruct(row, skip)
+		dbRow := Main.DB.QueryRow(query, vals...)
+		err := dbRow.Scan(&lastID)
+		if err != nil {
+			return ids, zlog.Error(query, vals, err)
+		}
+		ids = append(ids, lastID)
+	}
+	return ids, nil
+}
+
+func UpsertRow[S any](row S, table, conflictCol string, skipColumns []string, idCol, where string) (id int64, err error) {
+	var sets []string
+	params := FieldParametersFromStruct(row, skipColumns, 1)
+	vals := FieldValuesFromStruct(row, skipColumns)
+	for _, n := range ColumnNamesFromStruct(row, skipColumns, "") {
+		sets = append(sets, n+"=EXCLUDED."+n)
+	}
+	query := "INSERT INTO " + table + " (" + ColumnNamesStringFromStruct(row, skipColumns, "") + ") VALUES (" + params + ")\n"
+	query += "ON CONFLICT (" + conflictCol + ")\n"
+	query += "DO UPDATE SET " + strings.Join(sets, ",") + "\n"
+	if where != "" {
+		query += "WHERE " + where + "\n"
+	}
+	query += " RETURNING " + idCol + "\n"
+
+	dbRow := Main.DB.QueryRow(query, vals...)
+	err = dbRow.Scan(&id)
+	if err == sql.ErrNoRows {
+		err = nil
+	}
+	if zlog.OnError(err, ReplaceDollarArguments(query, vals...)) {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (SQLCalls) ExecuteQuery(query string, rowsAffected *int64) error {
+	query = CustomizeQuery(query, Main.Type)
+	result, err := Main.DB.Exec(query)
+	// zlog.Info("Exec:", query, err)
+	if err != nil {
+		return err
+	}
+	*rowsAffected, _ = result.RowsAffected()
+	return nil
+}
+
+func SelectSlicesOfAny[S any](base *Base, resultSlice *[]S, q QueryBase) error {
+	var s S
+	fields := ColumnNamesStringFromStruct(&s, q.SkipColumns, "")
+	query := zstr.Spaced("SELECT", fields, "FROM", q.Table)
+	if q.Constraints != "" {
+		query += " " + q.Constraints
+	}
+	query = CustomizeQuery(query, base.Type)
+
+	// zlog.Info("SelectSlicesOfAny:", query)
+	rows, err := base.DB.Query(query)
+	if err != nil {
+		return zlog.Error("select", query, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s S
+		pointers := FieldPointersFromStruct(&s, q.SkipColumns)
+		err = rows.Scan(pointers...)
+		if err != nil {
+			return zlog.Error("select", query, err)
+		}
+		*resultSlice = append(*resultSlice, s)
+	}
+	return nil
+}
+
+func SelectColumnAsSliceOfAny[A any](base *Base, query string, result *[]A) error {
+	query = CustomizeQuery(query, base.Type)
+	rows, err := base.DB.Query(query)
+	if err != nil {
+		return zlog.Error("select", query, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a A
+		err = rows.Scan(&a)
+		if err != nil {
+			return err
+		}
+		*result = append(*result, a)
+	}
+	return nil
+}
+
+func (SQLCalls) SelectInt64s(query string, result *[]int64) error {
+	return SelectColumnAsSliceOfAny(&Main, query, result)
+}
+
+func (b *Base) Exec(query string, args ...any) (sql.Result, error) {
+	var err error
+	if b.statementCache == nil {
+		b.statementCache = map[string]*sql.Stmt{}
+	}
+	s := b.statementCache[query]
+	if s == nil {
+		s, err = b.DB.Prepare(query)
+		if err != nil {
+			return nil, err
+		}
+		b.statementCache[query] = s
+	}
+	return s.Exec(args...)
+}
+
+// SelectIDOfNames generates a query that selects the id column for each name in the names slice.
+// Each id is 0 if the name doesn't exist
+func (b *Base) SelectIDOfNames(table, namecol, idcol string, names []string, where string) ([]int64, error) {
+	for i, n := range names {
+		names[i] = QuoteString(n)
+	}
+	snames := strings.Join(names, ",")
+	if where != "" {
+		where = "WHERE " + where
+	}
+	// query := "SELECT t.$id FROM unnest(ARRAY[$names]) $where AS $table($column) LEFT JOIN $table t ON t.$column = $table.$column"
+
+	query := `SELECT n.id
+				FROM unnest(ARRAY[$names]) AS input(name)
+				LEFT JOIN home n ON n.name = input.name`
+	query = zstr.ReplaceVariablesWithValues(query, "$", "", map[string]any{
+		"table":  table,
+		"column": namecol,
+		"id":     idcol,
+		"names":  snames,
+		"where":  where,
+	})
+	rows, err := b.DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	var id sql.NullInt64
+	for rows.Next() {
+		err = rows.Scan(&id)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id.Int64)
+	}
+	return ids, nil
+}
+
+func (base *Base) SelectString(query string, params ...any) (string, error) {
+	query = CustomizeQuery(query, base.Type)
+	row := base.DB.QueryRow(query, params...)
+	var result string
+	err := row.Scan(&result)
+	if err != nil {
+		return "", err
+	}
+	return result, nil
+}

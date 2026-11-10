@@ -1,0 +1,195 @@
+//go:build zui
+
+package zusers
+
+import (
+	"strconv"
+
+	"github.com/torlangballe/zed/zui/zalert"
+	"github.com/torlangballe/zed/zui/zfields"
+	"github.com/torlangballe/zed/zui/zlabel"
+	"github.com/torlangballe/zed/zui/zmenu"
+	"github.com/torlangballe/zed/zui/zpresent"
+	"github.com/torlangballe/zed/zui/zslicegrid"
+	"github.com/torlangballe/zed/zui/zstyle"
+	"github.com/torlangballe/zed/zutil/xrpc"
+	"github.com/torlangballe/zed/zutil/zgeo"
+	"github.com/torlangballe/zed/zutil/zlog"
+)
+
+type userTable struct {
+	users []User
+	grid  *zslicegrid.TableView[User]
+}
+
+func (t *userTable) findUser(id string) (*User, int) {
+	n, _ := strconv.ParseInt(id, 10, 64)
+	for i, u := range t.users {
+		if u.ID == n {
+			return &t.users[i], i
+		}
+	}
+	return nil, -1
+}
+
+func makeTableOwner(users []User) *userTable {
+	ut := &userTable{}
+	ut.users = users
+	ut.grid = zslicegrid.TableViewNew(&ut.users, "users", zslicegrid.AddDocumentationIcon|zslicegrid.AddMenu|zslicegrid.AllowEdit|zslicegrid.AllowDelete|zslicegrid.AllowDuplicate|zslicegrid.AddHeader|zslicegrid.AddBar)
+	ut.grid.EditParameters.SkipFieldNames = []string{"AdminStar"}
+	ut.grid.FieldViewParameters.AllStatic = true
+	ut.grid.SetBGColor(zstyle.DefaultBGColor())
+	ut.grid.Grid.MinRowsForFullSize = 10
+	ut.grid.Grid.MaxRowsForFullSize = 10
+	ut.grid.Grid.MakeFullSize = true
+	ut.grid.StructName = "user"
+	baseFunc := ut.grid.NameOfXItemsFunc
+	ut.grid.NameOfXItemsFunc = func(ids []string, singleSpecial bool) string {
+		if len(ids) == 1 && singleSpecial {
+			u, _ := ut.findUser(ids[0])
+			return `"` + u.UserName + `"`
+		}
+		return baseFunc(ids, singleSpecial)
+	}
+	old := ut.grid.DeleteItemsFunc
+	ut.grid.DeleteItemsFunc = func(ids []string) {
+		if !ut.checkBeforeDeleteItems(ids) {
+			return
+		}
+		old(ids)
+	}
+	ut.grid.ActionMenu.CreateItemsFunc = func() []zmenu.MenuedOItem {
+		selected := ut.grid.Grid.SelectedIDsOrHoverIDOrAll()
+		def := ut.grid.CreateDefaultMenuItems(selected, false)
+		nitems := ut.grid.NameOfXItemsFunc(selected, true)
+		return append(def,
+			zmenu.MenuedFuncAction("Unauthorize sessions for "+nitems, func() {
+				ut.unauthorizeUsers(ut.grid.Grid.SelectedIDs())
+			}),
+			zmenu.MenuedFuncAction("Add User…", ut.addUser),
+		)
+	}
+	ut.grid.StoreChangedItemFunc = storeUser
+	ut.grid.CallDeleteItemFunc = deleteUser
+	return ut
+}
+
+func (t *userTable) checkBeforeDeleteItems(ids []string) bool {
+	var deletingAdmin bool
+	for _, id := range ids {
+		u, _ := t.findUser(id)
+		zlog.Info("checkBeforeStoreChangedItems:", u.ID, CurrentUser.UserID)
+		if u.ID == CurrentUser.UserID {
+			zalert.Show("You can't delete your own user")
+			return false
+		}
+		if u.IsAdmin() {
+			deletingAdmin = true
+		}
+	}
+	if deletingAdmin {
+		for _, u := range t.users {
+			if u.IsAdmin() {
+				return true
+			}
+		}
+		zalert.Show("You can't delete the final admin user")
+		return false
+	}
+	return true
+}
+
+func storeUser(item User, last bool) error {
+	var changed ClientUserInfo
+	changed.Permissions = item.Permissions
+	changed.UserID = item.ID
+	changed.UserName = item.UserName
+	err := xrpc.MainCaller().Call("UsersCalls.ChangeUsersUserNameAndPermissions", changed, nil)
+	// zlog.Info("ChangeUsersUserNameAndPermissions", changed.Permissions, err)
+	return err
+}
+
+func deleteUser(sid string, showErr *bool, last bool) error {
+	userID, _ := strconv.ParseInt(sid, 10, 64)
+	err := xrpc.MainCaller().Call("UsersCalls.DeleteUserForID", userID, nil)
+	zlog.Info("deleteUsers", userID, err)
+	if err != nil && *showErr {
+		*showErr = false
+		zalert.ShowError(err, "delete user")
+	}
+	return err
+}
+
+func (t *userTable) unauthorizeUsers(sids []string) {
+	var shownError bool
+	for _, sid := range sids {
+		id, _ := strconv.ParseInt(sid, 10, 64)
+		t.grid.Grid.SetDirtyRow(sid)
+		err := xrpc.MainCaller().Call("UsersCalls.UnauthenticateUser", id, nil)
+		if err != nil && !shownError {
+			zalert.ShowError(err)
+			shownError = true
+		}
+		u, _ := t.findUser(sid)
+		u.Sessions = 0
+	}
+	t.grid.UpdateViewFunc(true, false)
+}
+
+func (u *User) HandleAction(ap zfields.ActionPack) bool {
+	// zlog.Info("Action:", action, zfields.ID(f))
+	if ap.Field == nil {
+		return false
+	}
+	switch ap.Action {
+	case zfields.SetupFieldAction:
+		if ap.Field.FieldName == "UserName" && UserNameIsEmail {
+			ap.Field.Name = "Email Address"
+			ap.Field.Format = "email"
+		}
+		return false
+	case zfields.DataChangedAction:
+		if ap.Field.FieldName == "UserName" {
+			label, _ := (*ap.View).(*zlabel.Label)
+			if label != nil { // it is null if it's a TextView in edit dialog
+				font := label.Font()
+				if u.UserName == CurrentUser.UserName {
+					font = font.NewWithStyle(zgeo.FontStyleBold)
+					label.SetFont(font)
+				}
+				if u.IsAdmin() {
+					label.SetText(u.UserName + "★")
+				}
+			}
+		}
+	}
+	return false
+}
+
+func getAndShowUserList() {
+	var us []User
+	err := xrpc.MainCaller().Call("UsersCalls.GetAllUsers", nil, &us)
+	if err != nil {
+		zalert.ShowError(err)
+		return
+	}
+	// zlog.Info("USERS:", zlog.Full(us))
+	table := makeTableOwner(us)
+	att := zpresent.ModalPopupAttributes()
+	att.ModalDimBackground = true
+	zpresent.PresentTitledView(table.grid, "Users", att, nil, nil)
+}
+
+func (t *userTable) addUser() {
+	OpenDialog(true, false, true, func() {
+		go func() {
+			err := xrpc.MainCaller().Call("UsersCalls.GetAllUsers", nil, &t.users)
+			if err != nil {
+				zalert.ShowError(err)
+				return
+			}
+			t.grid.UpdateViewFunc(true, true)
+			zlog.Info("Regged new user")
+		}()
+	})
+}
