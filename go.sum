@@ -211,6 +211,8 @@ github.com/riywo/loginshell v0.0.0-20200815045211-7d26008be1ab h1:ZjX6I48eZSFetP
 github.com/riywo/loginshell v0.0.0-20200815045211-7d26008be1ab/go.mod h1:/PfPXh0EntGc3QAAyUaviy4S9tzy4Zp0e2ilq4voC6E=
 github.com/rogpeppe/go-internal v1.10.0 h1:TMyTOH3F/DB16zRVcYyreMH6GnZZrwQVAoYjRBZyWFQ=
 github.com/rogpeppe/go-internal v1.10.0/go.mod h1:UQnix2H7Ngw/k4C5ijL5+65zddjncjaFoBhdsK/akog=
+github.com/russross/blackfriday/v2 v2.1.0 h1:JIOH55/0cWyOuilr9/qlrm0BSXldqnqwMsf35Ld67mk=
+github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
 github.com/sasha-s/go-deadlock v0.3.6 h1:TR7sfOnZ7x00tWPfD397Peodt57KzMDo+9Ae9rMiUmw=
 github.com/sasha-s/go-deadlock v0.3.6/go.mod h1:CUqNyyvMxTyjFqDT7MRg9mb4Dv/btmGTqSR+rky/UXo=
 github.com/sendgrid/rest v2.6.9+incompatible h1:1EyIcsNdn9KIisLW50MKwmSRSK+ekueiEMJ7NEoxJo0=
@@ -240,8 +242,6 @@ github.com/tklauser/go-sysconf v0.4.0 h1:7H0uAN+7RkwWRaxhYXDLqa5V3LPrJeV8wmD9dRU
 github.com/tklauser/go-sysconf v0.4.0/go.mod h1:8mTNWyog7H+MpKijp4VmKJAd2bbYQ2zuUwkYRbUArPI=
 github.com/tklauser/numcpus v0.12.0 h1:NR85qdvHA9pFse3x3weVZ0r0ST8R6l5RHbZrlRaqob4=
 github.com/tklauser/numcpus v0.12.0/go.mod h1:ABHeXzJnr/qqwguhClkZKT1/8VABcYrsyUiUGobwWJg=
-github.com/torlangballe/blackfridayV2 v0.0.0-20230907135525-adceae2f31a8 h1:HE9CgnpX4GVzOmgZSetJa3jmQMpLqG0lCmiePIQScrQ=
-github.com/torlangballe/blackfridayV2 v0.0.0-20230907135525-adceae2f31a8/go.mod h1:zlC+qcGSvf6Jjp9PSOyiZzK2aCDqfk5Ly/rmEHkFDM8=
 github.com/torlangballe/term v0.0.0-20230921133618-82d4fc38915b h1:+jaUzoSZ7ScZDp4fRO9Yz6k5RqZmOIjx/TmI7c5OFDA=
 github.com/torlangballe/term v0.0.0-20230921133618-82d4fc38915b/go.mod h1:mBuNyGnmDeFg4xYYy+j+6JS/x/95bZMuvw5lHP3uhK4=
 github.com/torlangballe/vnc2video v0.0.0-20220210123339-8aba5a28f286 h1:CHDS4msR3WoSJ/qlQdWitAjb3CYRkFdDpTrK7wNQ3xY=

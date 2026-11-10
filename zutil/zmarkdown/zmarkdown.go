@@ -17,7 +17,7 @@ import (
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
-	blackfriday "github.com/torlangballe/blackfridayV2"
+	blackfriday "github.com/russross/blackfriday/v2"
 	"github.com/torlangballe/zed/zui/zkeyboard"
 	"github.com/torlangballe/zed/zutil/zdevice"
 	"github.com/torlangballe/zed/zutil/zdict"

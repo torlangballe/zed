@@ -28,12 +28,12 @@ require (
 	github.com/pion/webrtc/v3 v3.3.6
 	github.com/prometheus/client_golang v1.23.2
 	github.com/riywo/loginshell v0.0.0-20200815045211-7d26008be1ab
+	github.com/russross/blackfriday/v2 v2.1.0
 	github.com/sasha-s/go-deadlock v0.3.6
 	github.com/sendgrid/sendgrid-go v3.16.1+incompatible
 	github.com/shirou/gopsutil/v4 v4.26.9
 	github.com/subosito/gozaru v0.0.0-20190625071150-416082cce636
 	github.com/timest/gomanuf v0.0.0-20230209100256-466f396c9305
-	github.com/torlangballe/blackfridayV2 v0.0.0-20230907135525-adceae2f31a8
 	github.com/torlangballe/term v0.0.0-20230921133618-82d4fc38915b
 	github.com/torlangballe/vnc2video v0.0.0-20220210123339-8aba5a28f286
 	golang.org/x/crypto v0.58.0
